@@ -5,10 +5,11 @@ platform team, private connectivity from every workload VPC, and attribute-based
 (ABAC) that follows a configurable business hierarchy such as
 **Platform → Solution → Product → Service**.
 
-> **Status: design.** This README is the design document. No Terraform code exists yet, nothing
-> has been deployed, and the items in [Assumptions to prove](#assumptions-to-prove) are untested.
-> The research behind the design is in
-> [docs/research-eventbridge-org-level.md](docs/research-eventbridge-org-level.md).
+> **Status: implemented, not yet run against AWS.** Both modules and the examples are written
+> and pass `terraform validate` and offline `terraform test`. Nothing has been applied to an AWS
+> account, so the items in [Assumptions to prove](#assumptions-to-prove) are still untested.
+> Run the [proof of concept](examples/proof-of-concept) first. The research behind the design is
+> in [docs/research-eventbridge-org-level.md](docs/research-eventbridge-org-level.md).
 
 ## Contents
 
@@ -22,6 +23,8 @@ platform team, private connectivity from every workload VPC, and attribute-based
 - [Module `central-bus`](#module-central-bus)
 - [Module `spoke-connection`](#module-spoke-connection)
 - [Organization guardrails](#organization-guardrails)
+- [Deployment order](#deployment-order)
+- [Testing](#testing)
 - [Limits and costs](#limits-and-costs)
 - [Assumptions to prove](#assumptions-to-prove)
 - [Fallback: Custom Event Bus - Classic](#fallback-custom-event-bus---classic)
@@ -34,7 +37,7 @@ Two Terraform modules, deployed by two different teams:
 | Module | Deployed by | Deployed in | Purpose |
 |---|---|---|---|
 | [`modules/central-bus`](#module-central-bus) | Platform team | One event platform account, once per Region | The shared event bus, its organization share, and the generated access policy |
-| [`modules/spoke-connection`](#module-spoke-connection) | Each workload team | Each workload account, once per VPC | Private endpoint to the bus, the workload's tagged IAM role, and its subscriptions |
+| [`modules/spoke-connection`](#module-spoke-connection) | Each workload team | Each workload account, once per service | Private endpoint to the bus, the workload's tagged IAM role, and its subscriptions |
 
 The rules the two modules enforce together:
 
@@ -49,12 +52,12 @@ The rules the two modules enforce together:
 | Decision | Choice | Why |
 |---|---|---|
 | Bus type | The EventBridge **Custom Event Bus** launched in September 2026 (`event-busv2`), not Custom Event Bus - Classic | It is the only EventBridge bus whose IAM model exposes publisher-supplied attributes (`events:Metadata/<key>`) on both publish and subscribe. Classic exposes only `source` and `detail-type`. |
-| Topology | One bus per Region, shared to the organization with AWS RAM | Matches current AWS guidance. Classic bus-to-bus forwarding is one hop only and caps at 300 rules per bus. |
+| Topology | One bus per Region, opened to the organization by its policy, optionally listed through AWS RAM | Matches current AWS guidance. Classic bus-to-bus forwarding is one hop only and caps at 300 rules per bus. |
 | Who owns consumption | Each spoke owns its subscribers, targets and delivery roles | The new bus requires the target to be in the subscriber owner's account, which fits a spoke module. |
 | Hierarchy encoding | One event metadata key and one IAM principal tag per level, same names | The policy compares the two directly, so the hierarchy is data, not code. |
 | Allow-lists | Declared as reviewed data in the central stack, rendered as explicit policy statements | An allow-list is an entitlement, not an attribute match. Tags on the consumer cannot say which producers it may read. |
 | Endpoints | One interface endpoint per spoke VPC | Lets each spoke carry its own least-privilege endpoint policy. |
-| Terraform resources for the bus | CloudFormation-backed resources, isolated behind the module interface | `hashicorp/aws` had no resource for the new bus as of 6.73.0. |
+| Terraform resources for the bus | The `awscc` provider (`awscc_eventsv2_event_bus`, `awscc_eventsv2_resource_policy`, `awscc_eventsv2_subscriber`), isolated behind the module interface | `hashicorp/aws` had no resource for the new bus as of 6.73.0. |
 
 The choice of the new bus is the largest bet in this design. It depends on behaviour AWS documents
 but does not demonstrate; see [Assumptions to prove](#assumptions-to-prove) and the
@@ -62,7 +65,7 @@ but does not demonstrate; see [Assumptions to prove](#assumptions-to-prove) and 
 
 ## Level 1: the organization
 
-The platform account owns the bus. AWS RAM shares it with the organization (or selected OUs).
+The platform account owns the bus and opens it to the organization through the bus policy.
 Every workload account reaches it through its own VPC endpoint and consumes through its own
 subscribers. Guardrails at organization level make the hierarchy tags trustworthy.
 
@@ -79,7 +82,7 @@ flowchart TB
     subgraph platform["Event platform account - module central-bus"]
       bus[["Central event bus"]]
       policy["Generated bus policy<br/>publish guardrails + allow-lists"]
-      share["AWS RAM share<br/>to organization or OUs"]
+      share["AWS RAM share<br/>optional, for discovery"]
       policy --- bus
       share --- bus
     end
@@ -240,7 +243,9 @@ sequenceDiagram
 ### Subscribing
 
 Access is decided when a subscriber is created or its filter is updated, not per delivered
-event. The filter is the request; the policy decides whether that filter is allowed.
+event. The filter is the request; the policy decides whether that filter is allowed. The
+caller is the consumer's deployment role (the principal Terraform runs as), so that role
+carries the service's hierarchy tags.
 
 ```mermaid
 sequenceDiagram
@@ -248,7 +253,7 @@ sequenceDiagram
   participant O as Owner team<br/>authorizer
   participant R as Grants in the central stack<br/>pull request
   participant B as Central event bus
-  participant C as Consumer team<br/>case-manager
+  participant C as Consumer deployment role<br/>tagged as case-manager
   participant Q as Consumer SQS queue
 
   O->>R: Add grant: case-manager may read authorizer events
@@ -321,7 +326,8 @@ content. `event-type` and `event-version` are conventions of this design, not ac
 
 ### Policy statements the central module generates
 
-All statements below are **illustrative and untested**. They show the intended shape.
+The statements below show the shape `central-bus` generates. They are **untested against
+AWS**. Deny statements also carry an exemption for `exempt_principal_arns` when that is set.
 
 **Publish only what you own.** One Deny per level, because conditions inside one statement are
 combined with AND and a mismatch on any single level must deny. Negated operators also match a
@@ -349,14 +355,17 @@ missing value, so an event without the key, or a role without the tag, is denied
   "Sid": "PaymentsAccountsOnly",
   "Effect": "Deny",
   "Principal": "*",
-  "Action": "events:*",
-  "Resource": "*",
+  "Action": ["events:PutEvents", "events:PutRawEvents", "events:CreateSubscriber", "events:UpdateSubscriber"],
+  "Resource": "arn:aws:events:eu-central-1:999999999999:event-busv2/org",
   "Condition": {
     "StringEquals": { "aws:PrincipalTag/platform": "payments" },
     "StringNotEquals": { "aws:PrincipalAccount": ["111111111111", "222222222222"] }
   }
 }
 ```
+
+A further Deny rejects any principal whose `platform` tag is missing or names no registered
+Platform.
 
 **Subscribe to your own events.** Constant size, whatever the number of services. The `Null`
 check closes a documented bypass: without it, a filter that omits a key passes
@@ -434,13 +443,15 @@ the filter conditions, the consumer's path in the principal-tag conditions.
 ### Properties worth knowing
 
 - **Subscribe rights are not granted through RAM.** RAM managed permissions carry no
-  conditions, so a RAM `SubscribeOnly` grant would let any account subscribe to anything. RAM
-  grants publish; the bus policy grants subscribe. Allow-lists are closed by default.
+  conditions, so a RAM `SubscribeOnly` grant would let any account subscribe to anything. The
+  bus policy grants subscribe, and allow-lists are closed by default.
+- **`PutEvents` is denied by default.** That API carries no metadata, so it would bypass the
+  hierarchy.
 - **Subscribe checks run at create and update only.** Tightening the policy or removing a grant
   does not stop an existing subscriber. The bus owner stops one with `RevokeResource`.
 - **Wider scopes are a filter with fewer keys.** Metadata filters are exact match only. A grant
-  on a whole Product is a grant whose required keys stop at `product`. `read_scope` on a grant
-  and `own_read_scope` on the bus control which levels are required.
+  on a whole Product is a grant whose `owner` stops at `product`. `own_read_scope` on the bus
+  does the same for reading without a grant.
 - **A batch is all or nothing.** One entry with wrong metadata denies the whole `PutRawEvents`
   call.
 
@@ -451,27 +462,33 @@ control policies do not apply there.
 
 **Creates**
 
-- The event bus, with retention and optional customer managed KMS key.
-- An AWS RAM share to the organization or to selected OUs, publish only.
+- The event bus, with retention and an optional customer managed KMS key.
 - The bus policy, generated from the hierarchy, the Platform account registry and the grants.
-- Alarms on delivered events and egress bytes per subscriber account.
+  The plan fails if the policy exceeds the size quota.
+- Optionally an AWS RAM share (publish only), which makes the bus discoverable in the
+  accounts it is shared with. Access itself comes from the bus policy.
 
-**Inputs (planned)**
+**Inputs**
 
-| Name | Type | Description |
-|---|---|---|
-| `name` | `string` | Bus name. |
-| `organization_id` | `string` | Used in every Allow statement. |
-| `share_with` | `list(string)` | Organization or OU ARNs for the RAM share. |
-| `hierarchy` | `list(string)` | Level names, top to bottom. Default `["platform", "solution", "product", "service"]`. Drives metadata keys, tag keys and generated conditions. |
-| `tag_key_prefix` | `string` | Optional prefix for the IAM tag keys. Default `""`. |
-| `platforms` | `map(object({ account_ids = list(string) }))` | Which accounts each top-level unit owns. |
-| `own_read_scope` | `string` | Level down to which a service may read without a grant. Default: the last level (its own events only). |
-| `grants` | `list(object)` | Allow-list entries: `owner` path, `consumer` path, optional `read_scope`. |
-| `retention_days` | `number` | Event retention. Default `7`. |
-| `kms_key_arn` | `string` | Optional customer managed key. |
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `name` | `string` | required | Bus name. |
+| `organization_id` | `string` | required | Limits every Allow statement to the organization. |
+| `platforms` | `map(object({ account_ids }))` | required | Top-level units and the accounts each one owns. |
+| `hierarchy` | `list(string)` | `["platform", "solution", "product", "service"]` | Level names, top to bottom. Drives metadata keys, tag keys and conditions. |
+| `tag_key_prefix` | `string` | `""` | Prefix for the IAM tag keys. Metadata keys are never prefixed. |
+| `own_read_scope` | `string` | last level | Level down to which a principal may subscribe without a grant. |
+| `grants` | `list(object({ owner, consumer }))` | `[]` | Allow-list. Both sides are a prefix of the hierarchy, so a grant can name one service or everything below a higher level. |
+| `exempt_principal_arns` | `list(string)` | `[]` | Principals exempt from the Deny guardrails (platform operators, forwarders of AWS service events). |
+| `allow_put_events` | `bool` | `false` | Allow the `PutEvents` envelope API, which carries no metadata. |
+| `share_with` | `list(string)` | `[]` | Organization, OU or account principals for the optional RAM share. |
+| `retention_days` | `number` | `7` | Event retention, 1 to 365. |
+| `kms_key_arn` | `string` | `null` | Customer managed key. |
+| `policy_size_limit` | `number` | `20480` | Policy size quota in bytes. |
+| `tags` | `map(string)` | `{}` | Tags for the bus and the share. |
 
-**Outputs (planned):** `bus_arn`, `bus_name`, `hierarchy`, `tag_keys`, `ram_share_arn`.
+**Outputs:** `bus_arn`, `bus_name`, `hierarchy`, `tag_key_prefix`, `tag_keys`, `policy_json`,
+`policy_bytes`, `ram_share_arn`.
 
 **Example**
 
@@ -481,7 +498,6 @@ module "central_bus" {
 
   name            = "org"
   organization_id = "o-exampleorgid"
-  share_with      = ["arn:aws:organizations::123456789012:organization/o-exampleorgid"]
 
   hierarchy = ["platform", "solution", "product", "service"]
 
@@ -492,77 +508,110 @@ module "central_bus" {
 
   grants = [
     {
+      # One service to one service.
       owner    = { platform = "payments", solution = "cards", product = "issuing", service = "authorizer" }
       consumer = { platform = "payments", solution = "cards", product = "disputes", service = "case-manager" }
     },
     {
-      owner    = { platform = "payments", solution = "cards", product = "issuing", service = "authorizer" }
-      consumer = { platform = "logistics", solution = "delivery", product = "tracking", service = "tracker" }
+      # A whole product to a whole platform.
+      owner    = { platform = "payments", solution = "cards", product = "issuing" }
+      consumer = { platform = "logistics" }
     },
   ]
 }
 ```
 
-**How owners allow-list consumers.** Grants live as files in the central stack (for example one
-YAML file per owner service under `grants/`). A `CODEOWNERS` entry makes the owning team the
-required reviewer of its own file. The pull request is the approval workflow; EventBridge has
-none of its own.
+**How owners allow-list consumers.** Keep grants as files in the central stack (for example one
+YAML file per owner service under `grants/`) and load them into `grants`. A `CODEOWNERS` entry
+makes the owning team the required reviewer of its own file. The pull request is the approval
+workflow; EventBridge has none of its own.
 
 ## Module `spoke-connection`
 
-Deployed in each workload account, once per VPC.
+Deployed once per service, in the service's account. The first service in a VPC creates the
+endpoints; later ones set `create_endpoints = false`.
 
 **Creates**
 
 - The EventBridge interface endpoint (`eventsv2`) with private DNS, its security group, and an
-  endpoint policy limited to the central bus and to organization principals.
-- Optionally the SQS interface endpoint.
-- One IAM role per declared service, tagged with its hierarchy path, with an identity policy
-  allowing publish to the central bus.
+  endpoint policy limited to the central bus and to organization principals. Optionally the SQS
+  interface endpoint.
+- The workload IAM role, tagged with the hierarchy path, allowed to publish to the bus and to
+  read its subscription queues.
 - For each subscription: a subscriber with a metadata filter, an SQS queue, a dead-letter
-  queue and a delivery role, all in the spoke account.
+  queue and a shared delivery role, all in the service's account.
 
-**Inputs (planned)**
+**Who runs it matters.** The bus policy authorizes `CreateSubscriber` against the tags of the
+principal that makes the call, which is the principal Terraform runs as, not the workload
+role. Each service therefore needs a **deployment role** tagged with the service's hierarchy
+path, and both providers passed to this module must assume it. The guardrail SCP lets a
+deployment role create only roles that carry its own tag values, so it can create its
+service's workload role and nothing else. See `examples/deployer-role`.
 
-| Name | Type | Description |
-|---|---|---|
-| `bus_arn` | `string` | Output of `central-bus`. |
-| `organization_id` | `string` | Used in the endpoint policy. |
-| `hierarchy` | `list(string)` | Must equal the central module's value. |
-| `vpc_id`, `subnet_ids` | `string`, `list(string)` | Where the endpoints go. |
-| `create_sqs_endpoint` | `bool` | Default `true`. |
-| `services` | `map(object)` | Per service: hierarchy `path`, role trust policy, `publish` flag, `subscriptions`. |
+**Inputs**
 
-Each subscription names the `owner` path it wants to read. Subscribing to another service's
-events succeeds only if the owner has added a matching grant in the central stack.
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `name` | `string` | required | Service short name. Prefix for the role, queues and subscribers. |
+| `bus_arn` | `string` | required | Output of `central-bus`. |
+| `organization_id` | `string` | required | Used in the endpoint policy. |
+| `path` | `map(string)` | required | One value per hierarchy level. |
+| `hierarchy` | `list(string)` | same default as `central-bus` | Must equal the central module's value. |
+| `tag_key_prefix` | `string` | `""` | Must equal the central module's value. |
+| `create_endpoints` | `bool` | `true` | Create the interface endpoints. |
+| `vpc_id`, `subnet_ids` | `string`, `list(string)` | `null`, `[]` | Where the endpoints go. |
+| `endpoint_ingress_cidr_blocks` | `list(string)` | VPC CIDR | Who may reach the endpoints on 443. |
+| `create_sqs_endpoint` | `bool` | `true` | Also create the SQS endpoint. |
+| `enable_endpoint_policy` | `bool` | `true` | Attach the endpoint policy. |
+| `endpoint_allowed_actions` | `list(string)` | publish and describe | Actions allowed through the endpoint. |
+| `create_role` | `bool` | `true` | Create the workload role. |
+| `assume_role_policy` | `string` | `null` | Trust policy of the workload role. Must not allow `sts:TagSession`. |
+| `permissions_boundary` | `string` | `null` | Boundary for the roles the module creates. |
+| `publish` | `bool` | `true` | Allow the workload role to publish. |
+| `subscriptions` | `map(object)` | `{}` | Per subscription: optional `owner` path prefix (default: this service), `transformer_type` (`WITH_METADATA` or `RAW`), queue timings. |
+| `tags` | `map(string)` | `{}` | Tags for every resource. |
 
-**Outputs (planned):** `endpoint_id`, `role_arns`, `queue_arns`, `subscriber_arns`.
+Subscribing to another owner's events succeeds only if the central stack holds a matching
+grant.
+
+**Outputs:** `role_arn`, `role_name`, `hierarchy_tags`, `event_metadata`, `events_endpoint_id`,
+`sqs_endpoint_id`, `endpoint_security_group_id`, `queue_arns`, `queue_urls`,
+`dead_letter_queue_arns`, `subscriber_arns`.
 
 **Example**
 
 ```hcl
+provider "aws" {
+  region = "eu-west-1"
+  assume_role {
+    role_arn = "arn:aws:iam::111111111111:role/deploy-case-manager"
+  }
+}
+
+provider "awscc" {
+  region = "eu-west-1"
+  assume_role = {
+    role_arn = "arn:aws:iam::111111111111:role/deploy-case-manager"
+  }
+}
+
 module "event_bus_connection" {
   source = "github.com/aws-abaschen/terraform-aws-org-event-bus//modules/spoke-connection"
 
-  bus_arn         = "arn:aws:events:eu-central-1:999999999999:event-busv2/org"
+  name            = "case-manager"
+  bus_arn         = "arn:aws:events:eu-west-1:999999999999:event-busv2/org/EXAMPLE1234567890abcdef"
   organization_id = "o-exampleorgid"
-  hierarchy       = ["platform", "solution", "product", "service"]
+  path            = { platform = "payments", solution = "cards", product = "disputes", service = "case-manager" }
 
   vpc_id     = "vpc-0abc"
   subnet_ids = ["subnet-0a", "subnet-0b"]
 
-  services = {
-    case-manager = {
-      path    = { platform = "payments", solution = "cards", product = "disputes", service = "case-manager" }
-      publish = true
-      subscriptions = {
-        own = {
-          owner = { platform = "payments", solution = "cards", product = "disputes", service = "case-manager" }
-        }
-        authorizations = {
-          owner = { platform = "payments", solution = "cards", product = "issuing", service = "authorizer" }
-        }
-      }
+  assume_role_policy = data.aws_iam_policy_document.ecs_trust.json
+
+  subscriptions = {
+    own            = {}
+    authorizations = {
+      owner = { platform = "payments", solution = "cards", product = "issuing", service = "authorizer" }
     }
   }
 }
@@ -571,17 +620,42 @@ module "event_bus_connection" {
 ## Organization guardrails
 
 ABAC on a shared bus is only as sound as the tags. These controls are prerequisites and sit
-outside both modules, in the organization's guardrail stack. An example will be provided under
-`examples/guardrails`.
+outside both modules. `examples/guardrails` implements them.
 
 | Control | Type | Effect |
 |---|---|---|
-| Protect hierarchy tag keys | SCP | Denies `iam:TagRole`, `iam:UntagRole` and `sts:TagSession` on the hierarchy keys for every principal except the provisioning role that applies `spoke-connection`. |
+| No hierarchy session tags | SCP | Denies `sts:TagSession` with a hierarchy key. Session tags would override role tags. |
+| Tag inheritance | SCP | A principal may put a hierarchy tag on an IAM role or user only with the value it carries itself. Untagged principals can set none. |
+| No tag removal | SCP | Denies removing a hierarchy tag from a role or user. |
 | Organization principals only | RCP | Event buses reject callers outside the organization. Does not cover the management account or service-linked roles. |
-| Allowed tag values | Tag policy | Standardizes spelling and values. Hygiene only; it does not evaluate untagged resources. |
+| Allowed tag values | Tag policy | Standardizes keys and top-level values. Hygiene only; it does not evaluate untagged resources. |
+
+The account vending or provisioning roles are exempt from the SCP, because they create each
+service's deployment role with its tags. Sessions federated through SAML or OIDC are not
+subject to the session-tag statement in the same way; make sure the identity provider does not
+pass hierarchy keys as session tags.
 
 Organizations account tags are not visible to IAM, which is why the hierarchy is copied onto
 roles and the account-to-Platform mapping is passed to `central-bus` explicitly.
+
+## Deployment order
+
+1. **Proof of concept** (`examples/proof-of-concept`): two accounts, confirms the access model.
+2. **Guardrails** (`examples/guardrails`): from the management account, before any spoke.
+3. **Central bus** (`modules/central-bus`): in the event platform account.
+4. **Deployment role per service** (`examples/deployer-role`): by the provisioning role.
+5. **Spoke connection per service** (`modules/spoke-connection`): by each service's deployment
+   role. `examples/complete` shows steps 3 and 5 wired together.
+
+## Testing
+
+| What | How | Proves |
+|---|---|---|
+| Module logic | `terraform test` in `modules/central-bus` and `modules/spoke-connection` | The generated policy, tags, filters and endpoint are what the design says. Offline, mocked providers. |
+| Access model | `examples/proof-of-concept` (`terraform apply`, then `./run-tests.sh`) | AWS evaluates the policy as intended, across two accounts. Twelve allow and deny cases. |
+
+The module tests pass. The proof of concept has not been run: nothing in this repository has
+been applied to an AWS account yet.
 
 ## Limits and costs
 
@@ -594,27 +668,28 @@ Figures from the research report; confirm against the live AWS pages before rely
 | Buses of this type per account | 5 by default. |
 | Throughput | 500,000 events per second per bus. |
 | Event size | 1 MB. |
-| Subscriber changes | One create or delete in progress per bus across all accounts. Parallel spoke applies must retry. |
+| Subscriber changes | One create or delete in progress per bus across all accounts. |
 | Regions | 14 at launch. Bus, publishers and subscribers must share a Region. |
 | Pricing | Per GB: publishers pay ingress, subscribers pay egress. |
 | Interface endpoint | Billed per endpoint, per Availability Zone, per hour, plus data. |
 
 The policy size is the scaling limit of the allow-list. Past it, grants move out of the bus
 policy into a control plane that creates subscribers on behalf of consumers. That is out of
-scope for the first version.
+scope for this version.
 
 ## Assumptions to prove
 
-A proof of concept must settle these before any module code is written, in this order.
+Run the proof of concept before relying on the modules. In order of how much design fails
+with each:
 
 | # | Assumption | If it fails |
 |---|---|---|
 | 1 | `events:Metadata/<key>` can be compared with `${aws:PrincipalTag/<key>}` on `PutRawEvents`, `CreateSubscriber` and `UpdateSubscriber`, in a bus policy, for callers in other accounts. AWS's policy language permits it; no AWS example shows it. | Fall back to literal per-service statements keyed on `aws:PrincipalAccount`, or a publish API that stamps metadata from the caller's identity. |
 | 2 | The bus policy size fits the expected number of grants. | Bring the control plane forward. |
-| 3 | The `eventsv2` interface endpoint supports endpoint policies. | Rely on identity and bus policies; treat the endpoint as a network path only. |
+| 3 | The `eventsv2` interface endpoint supports endpoint policies. | Set `enable_endpoint_policy = false`; rely on identity and bus policies. |
 | 4 | The bus is available in the target Region. | Use the Classic fallback in that Region. |
-| 5 | The CloudFormation-backed Terraform route works under the one-at-a-time subscriber quota. | Add serialization or retries in the spoke module. |
-| 6 | The RAM publish permission does not also allow the classic `PutEvents` envelope, which carries no metadata. | Add an explicit Deny on `events:PutEvents` for workload principals. |
+| 5 | Terraform can create several subscribers in one apply despite the one-at-a-time rule. | Apply the spoke with `-parallelism=1`. |
+| 6 | The tag-inheritance SCP (a policy variable compared with `aws:RequestTag`) behaves as written. | Restrict tagging to the provisioning roles only and have them create the workload roles. |
 
 ## Fallback: Custom Event Bus - Classic
 
@@ -628,9 +703,9 @@ with weaker guarantees:
 - The interface endpoint is `events` instead of `eventsv2`.
 - Native `hashicorp/aws` resources cover everything.
 
-## Repository layout
+This fallback is not implemented.
 
-Planned. Only this README and the research report exist today.
+## Repository layout
 
 ```text
 .
@@ -638,10 +713,13 @@ Planned. Only this README and the research report exist today.
 ├── docs/
 │   └── research-eventbridge-org-level.md
 ├── modules/
-│   ├── central-bus/
-│   └── spoke-connection/
+│   ├── central-bus/          # bus, generated policy, optional RAM share
+│   │   └── tests/
+│   └── spoke-connection/     # endpoints, workload role, subscriptions
+│       └── tests/
 └── examples/
-    ├── complete/          # one platform account, two spokes
-    ├── guardrails/        # SCP, RCP and tag policy
-    └── proof-of-concept/  # the tests in "Assumptions to prove"
+    ├── complete/             # one platform account, two workload accounts
+    ├── deployer-role/        # tagged deployment role for one service
+    ├── guardrails/           # SCP, RCP and tag policy
+    └── proof-of-concept/     # the access-model tests
 ```
