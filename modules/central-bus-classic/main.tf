@@ -21,14 +21,83 @@ locals {
     )
   }
 
+  # Customer managed key of the bus and the dead-letter queue.
+  create_key = var.kms_key_arn == null && var.create_kms_key
+  key_arn    = var.kms_key_arn != null ? var.kms_key_arn : try(aws_kms_key.this[0].arn, null)
+
   target_account = { for k, s in var.subscriptions : k => split(":", s.target_arn)[4] }
+}
+
+# --- Encryption --------------------------------------------------------------
+
+# Encrypts the bus and the dead-letter queue. EventBridge is the only service
+# principal, limited to this bus and its rules by the conditions below. The
+# bus ARN is built from the name so the key does not depend on the bus.
+resource "aws_kms_key" "this" {
+  count = local.create_key ? 1 : 0
+
+  description             = "Event bus ${var.name}"
+  enable_key_rotation     = true
+  deletion_window_in_days = 30
+  tags                    = var.tags
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "EnableIAMPolicies"
+        Effect    = "Allow"
+        Principal = { AWS = "arn:${local.partition}:iam::${local.account}:root" }
+        Action    = "kms:*"
+        Resource  = "*"
+      },
+      {
+        Sid       = "EventBridgeEncryptsTheBus"
+        Effect    = "Allow"
+        Principal = { Service = "events.amazonaws.com" }
+        Action    = ["kms:DescribeKey", "kms:GenerateDataKey", "kms:Decrypt"]
+        Resource  = "*"
+        Condition = {
+          StringEquals = {
+            "kms:EncryptionContext:aws:events:event-bus:arn" = "arn:${local.partition}:events:${local.region}:${local.account}:event-bus/${var.name}"
+          }
+        }
+      },
+      {
+        Sid       = "RulesWriteToTheDeadLetterQueue"
+        Effect    = "Allow"
+        Principal = { Service = "events.amazonaws.com" }
+        Action    = ["kms:GenerateDataKey", "kms:Decrypt"]
+        Resource  = "*"
+        Condition = {
+          ArnLike = {
+            "aws:SourceArn" = "arn:${local.partition}:events:${local.region}:${local.account}:rule/${var.name}/*"
+          }
+        }
+      },
+    ]
+  })
+}
+
+resource "aws_kms_alias" "this" {
+  count = local.create_key ? 1 : 0
+
+  name          = "alias/${var.name}-event-bus"
+  target_key_id = aws_kms_key.this[0].key_id
 }
 
 resource "aws_cloudwatch_event_bus" "this" {
   name               = var.name
   description        = var.description
-  kms_key_identifier = var.kms_key_arn
+  kms_key_identifier = local.key_arn
   tags               = var.tags
+
+  lifecycle {
+    precondition {
+      condition     = local.key_arn != null
+      error_message = "The bus needs a customer managed key: set kms_key_arn, or leave create_kms_key true."
+    }
+  }
 }
 
 resource "aws_cloudwatch_event_bus_policy" "this" {
@@ -74,12 +143,22 @@ resource "aws_iam_role_policy" "delivery" {
   role = aws_iam_role.delivery.id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Sid      = "DeliverToConsumerQueues"
-      Effect   = "Allow"
-      Action   = "sqs:SendMessage"
-      Resource = distinct([for s in values(var.subscriptions) : s.target_arn])
-    }]
+    Statement = concat(
+      [{
+        Sid      = "DeliverToConsumerQueues"
+        Effect   = "Allow"
+        Action   = "sqs:SendMessage"
+        Resource = distinct([for s in values(var.subscriptions) : s.target_arn])
+      }],
+      [
+        for s in [{
+          Sid      = "EncryptForConsumerQueues"
+          Effect   = "Allow"
+          Action   = ["kms:GenerateDataKey", "kms:Decrypt"]
+          Resource = distinct([for s in values(var.subscriptions) : s.target_kms_key_arn if s.target_kms_key_arn != null])
+        }] : s if length([for s in values(var.subscriptions) : s if s.target_kms_key_arn != null]) > 0
+      ],
+    )
   })
 }
 
@@ -88,7 +167,7 @@ resource "aws_iam_role_policy" "delivery" {
 resource "aws_sqs_queue" "dead_letter" {
   name                      = "${var.name}-event-dlq"
   message_retention_seconds = 1209600
-  sqs_managed_sse_enabled   = true
+  kms_master_key_id         = local.key_arn
   tags                      = var.tags
 }
 

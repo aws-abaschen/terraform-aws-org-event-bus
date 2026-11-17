@@ -52,3 +52,8 @@ output "subscriber_arns" {
   description = "Subscription key => ARN of its subscriber."
   value       = { for k, s in awscc_eventsv2_subscriber.this : k => s.subscriber_arn }
 }
+
+output "kms_key_arn" {
+  description = "Customer managed key of the queues, or null when there are no subscriptions."
+  value       = local.key_arn
+}

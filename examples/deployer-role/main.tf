@@ -58,6 +58,7 @@ resource "aws_iam_role" "this" {
 }
 
 resource "aws_iam_role_policy_attachment" "this" {
+  # checkov:skip=CKV_AWS_274: the policies are the caller's choice (managed_policy_arns); the example default is a placeholder to replace.
   for_each = toset(var.managed_policy_arns)
 
   role       = aws_iam_role.this.name

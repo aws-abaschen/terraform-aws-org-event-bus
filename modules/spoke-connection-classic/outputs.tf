@@ -38,6 +38,11 @@ output "queue_arns" {
   value       = { for k, q in aws_sqs_queue.this : k => q.arn }
 }
 
+output "kms_key_arn" {
+  description = "Customer managed key of the queues, or null when there are no queues. Give it to the platform team as target_kms_key_arn of the subscription."
+  value       = local.key_arn
+}
+
 output "queue_urls" {
   description = "Queue key => URL."
   value       = { for k, q in aws_sqs_queue.this : k => q.url }

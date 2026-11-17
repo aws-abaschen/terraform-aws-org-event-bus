@@ -1,0 +1,12 @@
+framework:
+  - terraform
+directory:
+  - .
+compact: true
+quiet: true
+skip-download: true
+# Local provider downloads and state are not source.
+skip-path:
+  - .terraform
+# Suppress an individual finding inline, with the reason, next to the resource:
+#   # checkov:skip=CKV_AWS_xxx: why this is intended

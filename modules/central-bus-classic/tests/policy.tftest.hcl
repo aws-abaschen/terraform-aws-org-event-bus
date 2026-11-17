@@ -87,6 +87,27 @@ run "default_hierarchy" {
   }
 
   assert {
+    condition = (
+      aws_kms_key.this[0].enable_key_rotation &&
+      aws_cloudwatch_event_bus.this.kms_key_identifier == aws_kms_key.this[0].arn &&
+      aws_sqs_queue.dead_letter.kms_master_key_id == aws_kms_key.this[0].arn
+    )
+    error_message = "The bus and the dead-letter queue must use the created, rotating key."
+  }
+
+  assert {
+    condition = one([
+      for s in jsondecode(aws_kms_key.this[0].policy).Statement : s if s.Sid == "EventBridgeEncryptsTheBus"
+    ]).Condition.StringEquals["kms:EncryptionContext:aws:events:event-bus:arn"] == "arn:aws:events:eu-west-1:999999999999:event-bus/org"
+    error_message = "EventBridge may use the key for this bus only."
+  }
+
+  assert {
+    condition     = length([for s in jsondecode(aws_iam_role_policy.delivery[0].policy).Statement : s if s.Sid == "EncryptForConsumerQueues"]) == 0
+    error_message = "No consumer key declared, no KMS statement."
+  }
+
+  assert {
     condition     = jsondecode(aws_cloudwatch_event_rule.subscription["tracker-own"].event_pattern) == { source = ["logistics.delivery.tracking.tracker"] }
     error_message = "A full owner path must match one source exactly."
   }
@@ -153,6 +174,44 @@ run "custom_hierarchy_prefix_separator_and_exemption" {
     condition     = length(aws_iam_role_policy.delivery) == 0
     error_message = "Without subscriptions the delivery role has no policy."
   }
+}
+
+run "grants_the_delivery_role_a_consumer_key" {
+  command = apply
+
+  variables {
+    kms_key_arn = "arn:aws:kms:eu-west-1:999999999999:key/11111111-2222-3333-4444-555555555555"
+    subscriptions = {
+      tracker-own = {
+        owner              = { platform = "logistics", solution = "delivery", product = "tracking", service = "tracker" }
+        consumer           = { platform = "logistics", solution = "delivery", product = "tracking", service = "tracker" }
+        target_arn         = "arn:aws:sqs:eu-west-1:333333333333:tracker-own"
+        target_kms_key_arn = "arn:aws:kms:eu-west-1:333333333333:key/66666666-7777-8888-9999-000000000000"
+      }
+    }
+  }
+
+  assert {
+    condition = one([
+      for s in jsondecode(aws_iam_role_policy.delivery[0].policy).Statement : s if s.Sid == "EncryptForConsumerQueues"
+    ]).Resource == ["arn:aws:kms:eu-west-1:333333333333:key/66666666-7777-8888-9999-000000000000"]
+    error_message = "The delivery role needs IAM permission on the consumer's key."
+  }
+
+  assert {
+    condition     = length(aws_kms_key.this) == 0 && aws_cloudwatch_event_bus.this.kms_key_identifier == var.kms_key_arn
+    error_message = "A supplied key replaces the created one."
+  }
+}
+
+run "refuses_a_bus_without_a_key" {
+  command = plan
+
+  variables {
+    create_kms_key = false
+  }
+
+  expect_failures = [aws_cloudwatch_event_bus.this]
 }
 
 run "rejects_queue_outside_the_consumer_accounts" {

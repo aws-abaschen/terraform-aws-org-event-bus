@@ -38,6 +38,11 @@ output "dead_letter_queue_arn" {
   value       = aws_sqs_queue.dead_letter.arn
 }
 
+output "kms_key_arn" {
+  description = "Customer managed key of the bus and the dead-letter queue."
+  value       = local.key_arn
+}
+
 output "rule_arns" {
   description = "Subscription key => ARN of its rule."
   value       = { for k, r in aws_cloudwatch_event_rule.subscription : k => r.arn }
