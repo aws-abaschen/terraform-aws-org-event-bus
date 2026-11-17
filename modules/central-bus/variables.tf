@@ -47,7 +47,7 @@ variable "tag_key_prefix" {
 }
 
 variable "platforms" {
-  description = "Top-level units and the AWS accounts each one owns. A principal whose top-level tag names a unit is denied unless it is in one of that unit's accounts; a principal whose top-level tag names no registered unit is denied."
+  description = "Top-level units and the AWS accounts each one owns. A principal whose top-level tag names a unit is denied unless it is in one of that unit's accounts; a principal whose top-level tag names no registered unit is denied. Build it from account tags with the account-platforms module (output platforms)."
   type = map(object({
     account_ids = list(string)
   }))
@@ -92,6 +92,34 @@ variable "grants" {
     ]))
     error_message = "Each owner and consumer must name a prefix of the hierarchy, starting at the top level with no gaps."
   }
+}
+
+variable "visibility_key" {
+  description = "Event metadata key in which a producer names who may read the event: an audience namespace such as payments.cards, or visibility_public_value. Events without it are readable only by their owner and by grants."
+  type        = string
+  default     = "visibility"
+
+  validation {
+    condition     = can(regex("^[A-Za-z][A-Za-z0-9_-]*$", var.visibility_key)) && !contains(var.hierarchy, var.visibility_key)
+    error_message = "visibility_key must be a valid key name and must not be a hierarchy level."
+  }
+}
+
+variable "visibility_separator" {
+  description = "Joins hierarchy values into an audience namespace (payments.cards.issuing). No hierarchy value may contain it."
+  type        = string
+  default     = "."
+
+  validation {
+    condition     = can(regex("^[^A-Za-z0-9*?$]$", var.visibility_separator))
+    error_message = "visibility_separator must be one character that is not a letter, a digit, *, ? or $."
+  }
+}
+
+variable "visibility_public_value" {
+  description = "Audience value that makes an event readable by every principal of the organization. Null disables organization-wide visibility."
+  type        = string
+  default     = "public"
 }
 
 variable "exempt_principal_arns" {

@@ -14,8 +14,13 @@ output "hierarchy_tags" {
 }
 
 output "event_metadata" {
-  description = "Metadata every published event must carry (PutRawEvents Metadata)."
+  description = "Metadata every published event must carry (PutRawEvents Metadata). Add the visibility key to make an event readable beyond this service."
   value       = { for l in var.hierarchy : l => var.path[l] }
+}
+
+output "visibility_audiences" {
+  description = "Audiences this service belongs to, widest first, then the public value. Use them in subscriptions[*].visibility. Producers put any audience, not only these, in the visibility metadata key."
+  value       = local.visibility_audiences
 }
 
 output "events_endpoint_id" {

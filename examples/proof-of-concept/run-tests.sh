@@ -106,6 +106,7 @@ publish_case "owner publishes its own path"            allowed "$ROLE_OWNER"    
 publish_case "owner publishes another service's path"  denied  "$ROLE_OWNER"    "$META_WRONG_LEVEL"
 publish_case "owner publishes without the last level"  denied  "$ROLE_OWNER"    "$META_MISSING_LEVEL"
 publish_case "stranger publishes as the owner"         denied  "$ROLE_STRANGER" "$META_OWNER"
+publish_case "owner publishes with a visibility"       allowed "$ROLE_OWNER"    "$META_OWNER_VISIBLE"
 
 echo "== Publish (PutEvents envelope, no metadata) =="
 assume "$ROLE_OWNER" && {
@@ -121,6 +122,13 @@ subscribe_case "granted consumer subscribes to itself"     allowed "$ROLE_GRANTE
 subscribe_case "stranger subscribes to owner"              denied  "$ROLE_STRANGER" stranger     "$FILTER_OWNER"
 subscribe_case "granted consumer omits the last level"     denied  "$ROLE_GRANTED"  wide         "$FILTER_MISSING_LEVEL"
 subscribe_case "stranger subscribes with no filter"        denied  "$ROLE_STRANGER" nofilter
+
+echo "== Subscribe by visibility =="
+subscribe_case "same solution reads its audience"         allowed "$ROLE_GRANTED"  vis-solution "$FILTER_VIS_SOLUTION"
+subscribe_case "other platform reads that audience"       denied  "$ROLE_STRANGER" vis-foreign  "$FILTER_VIS_SOLUTION"
+subscribe_case "other platform reads public"              allowed "$ROLE_STRANGER" vis-public   "$FILTER_VIS_PUBLIC"
+subscribe_case "other platform mixes public and foreign"  denied  "$ROLE_STRANGER" vis-mixed    "$FILTER_VIS_MIXED"
+subscribe_case "second filter smuggles a foreign path"    denied  "$ROLE_STRANGER" two-filters  "$FILTER_TWO_FILTERS"
 
 echo "== Tag trust =="
 if assume "$ROLE_STRANGER" --tags "Key=$TAG_KEY,Value=authorizer"; then

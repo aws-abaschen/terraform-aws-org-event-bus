@@ -14,13 +14,13 @@ variable "platform_profile" {
   type        = string
 }
 
-variable "payments_profile" {
-  description = "AWS CLI profile able to assume the authorizer deployment role."
+variable "organization_profile" {
+  description = "AWS CLI profile able to read AWS Organizations: the management account or a delegated administrator."
   type        = string
 }
 
-variable "payments_account_id" {
-  description = "Account ID owned by the payments platform."
+variable "payments_profile" {
+  description = "AWS CLI profile able to assume the authorizer deployment role."
   type        = string
 }
 
@@ -41,11 +41,6 @@ variable "authorizer_deployer_role_arn" {
 
 variable "logistics_profile" {
   description = "AWS CLI profile able to assume the tracker deployment role."
-  type        = string
-}
-
-variable "logistics_account_id" {
-  description = "Account ID owned by the logistics platform."
   type        = string
 }
 

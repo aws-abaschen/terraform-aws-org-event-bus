@@ -43,6 +43,25 @@ variable "path" {
     condition     = toset(keys(var.path)) == toset(var.hierarchy)
     error_message = "path must have exactly one value for each hierarchy level."
   }
+
+  validation {
+    condition     = alltrue([for v in values(var.path) : !strcontains(v, var.visibility.separator)])
+    error_message = "No path value may contain the visibility separator."
+  }
+}
+
+variable "visibility" {
+  description = "Visibility settings of the bus (output visibility of central-bus)."
+  type = object({
+    key          = string
+    separator    = string
+    public_value = optional(string)
+  })
+  default = {
+    key          = "visibility"
+    separator    = "."
+    public_value = "public"
+  }
 }
 
 # --- Network -----------------------------------------------------------------
@@ -122,15 +141,22 @@ variable "subscriptions" {
     Subscriptions of this service. Each creates a subscriber on the central
     bus, an SQS queue and a dead-letter queue in this account.
 
-    owner names whose events to receive, as a prefix of the hierarchy. Omit
-    it to receive this service's own events. Subscribing to another owner
-    succeeds only if the bus policy holds a matching grant.
+    visibility lists audiences to receive events for: values of the
+    producers' visibility metadata. Each must be this service's path cut at
+    some level (payments, payments.cards, ...) or the public value; output
+    visibility_audiences lists them. Any producer that set one of them is
+    received, unless owner narrows it down.
+
+    owner names whose events to receive, as a prefix of the hierarchy. Without
+    visibility, omit it to receive this service's own events; another owner
+    then needs a grant in the bus policy.
 
     transformer_type selects what the queue receives: WITH_METADATA (payload,
     metadata and system metadata) or RAW (payload only).
   EOT
   type = map(object({
     owner                      = optional(map(string))
+    visibility                 = optional(list(string))
     transformer_type           = optional(string, "WITH_METADATA")
     visibility_timeout_seconds = optional(number, 30)
     message_retention_seconds  = optional(number, 345600)
@@ -145,6 +171,19 @@ variable "subscriptions" {
       )
     ])
     error_message = "owner must name a prefix of the hierarchy, starting at the top level with no gaps."
+  }
+
+  validation {
+    condition = alltrue(flatten([
+      for s in values(var.subscriptions) : s.visibility == null ? [true] : concat(
+        [length(s.visibility) > 0],
+        [for v in s.visibility : contains(concat(
+          [for d in range(1, length(var.hierarchy) + 1) : join(var.visibility.separator, [for l in slice(var.hierarchy, 0, d) : var.path[l]])],
+          var.visibility.public_value == null ? [] : [var.visibility.public_value],
+        ), v)]
+      )
+    ]))
+    error_message = "visibility must list audiences this service belongs to: its path cut at some level, or the public value."
   }
 
   validation {

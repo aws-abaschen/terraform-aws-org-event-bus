@@ -22,6 +22,16 @@ resource "awscc_eventsv2_resource_policy" "this" {
       condition     = length(local.policy_json) <= var.policy_size_limit
       error_message = "The generated bus policy is ${length(local.policy_json)} bytes, over the ${var.policy_size_limit}-byte quota. Reduce the number of grants, widen them to a higher level, or request a quota increase and raise policy_size_limit."
     }
+
+    # Platform names come from account tags; keep them from spelling another
+    # audience or the organization-wide one.
+    precondition {
+      condition = alltrue([
+        for p in keys(var.platforms) :
+        !strcontains(p, var.visibility_separator) && p != var.visibility_public_value
+      ])
+      error_message = "Platform names may not contain \"${var.visibility_separator}\" or equal the public visibility value."
+    }
   }
 }
 

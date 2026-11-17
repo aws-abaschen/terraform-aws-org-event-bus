@@ -38,6 +38,8 @@ variables {
     own     = {}
     cards   = { owner = { platform = "payments", solution = "cards", product = "issuing", service = "authorizer" } }
     product = { owner = { platform = "payments", solution = "cards", product = "issuing" }, transformer_type = "RAW" }
+    shared  = { visibility = ["logistics.delivery", "public"] }
+    narrow  = { visibility = ["logistics.delivery.tracking"], owner = { platform = "payments" } }
   }
 }
 
@@ -79,8 +81,29 @@ run "derives_tags_filters_and_endpoint" {
   }
 
   assert {
-    condition     = length(aws_sqs_queue.subscription) == 3 && length(aws_sqs_queue.dead_letter) == 3
+    condition     = length(aws_sqs_queue.subscription) == 5 && length(aws_sqs_queue.dead_letter) == 5
     error_message = "Each subscription needs a queue and a dead-letter queue."
+  }
+
+  assert {
+    condition = jsonencode(jsondecode(awscc_eventsv2_subscriber.this["shared"].filter_configuration.filters[0].pattern)) == jsonencode({
+      visibility = ["logistics.delivery", "public"]
+    })
+    error_message = "A visibility subscription without owner must filter on the audiences only, not on this service's path."
+  }
+
+  assert {
+    condition = jsonencode(jsondecode(awscc_eventsv2_subscriber.this["narrow"].filter_configuration.filters[0].pattern)) == jsonencode({
+      platform = ["payments"], visibility = ["logistics.delivery.tracking"]
+    })
+    error_message = "An owner given with visibility must narrow the filter."
+  }
+
+  assert {
+    condition = jsonencode(output.visibility_audiences) == jsonencode([
+      "logistics", "logistics.delivery", "logistics.delivery.tracking", "logistics.delivery.tracking.tracker", "public",
+    ])
+    error_message = "The audiences must be the path cut at every level, then the public value."
   }
 
   assert {
@@ -150,6 +173,28 @@ run "rejects_incomplete_path" {
 
   variables {
     path = { platform = "logistics", solution = "delivery" }
+  }
+
+  expect_failures = [var.path]
+}
+
+run "rejects_foreign_audience" {
+  command = plan
+
+  variables {
+    subscriptions = {
+      peek = { visibility = ["payments.cards"] }
+    }
+  }
+
+  expect_failures = [var.subscriptions]
+}
+
+run "rejects_separator_in_path" {
+  command = plan
+
+  variables {
+    path = { platform = "logistics", solution = "delivery.tracking", product = "x", service = "tracker" }
   }
 
   expect_failures = [var.path]
