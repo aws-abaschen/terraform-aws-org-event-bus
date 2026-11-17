@@ -27,6 +27,17 @@ locals {
     StringEquals = { for l in local.own_levels : "events:Metadata/${l}/Matcher" => "exact" }
   }
 
+  # Audience namespaces a principal belongs to: its own path cut at every
+  # depth (payments, payments.cards, ... down to its service), plus the
+  # organization-wide value. IAM resolves the tag variables per request.
+  visibility_audiences = concat(
+    [
+      for d in range(1, length(var.hierarchy) + 1) :
+      join(var.visibility_separator, [for l in slice(var.hierarchy, 0, d) : "$${aws:PrincipalTag/${local.tag_key[l]}}"])
+    ],
+    var.visibility_public_value == null ? [] : [var.visibility_public_value],
+  )
+
   statements = concat(
     # --- Organization-wide publish -------------------------------------------
     [
@@ -136,7 +147,49 @@ locals {
       },
     ],
 
+    # --- Subscribe to events the producer made visible to you ----------------
+    # The producer sets the visibility key on each event; that is its consent.
+    # The filter must name the key, exactly, with only audiences the caller
+    # belongs to. Producer levels in the same filter are not constrained: they
+    # only narrow what is received.
+    [
+      {
+        Sid       = "SubscribeVisibleEvents"
+        Effect    = "Allow"
+        Principal = "*"
+        Action    = local.subscribe_actions
+        Resource  = local.bus_arn
+        Condition = {
+          Null = { "events:Metadata/${var.visibility_key}" = "false" }
+          StringEquals = merge(local.org_condition, {
+            "events:Metadata/${var.visibility_key}/Matcher" = "exact"
+          })
+          "ForAllValues:StringEquals" = {
+            "events:Metadata/${var.visibility_key}" = local.visibility_audiences
+          }
+        }
+      },
+    ],
+
+    # --- A tag value may not span levels -------------------------------------
+    # Audiences join tag values with the separator, so a value containing it
+    # could spell another unit's namespace. One Deny per level: conditions in
+    # one statement are ANDed.
+    [
+      for l in var.hierarchy : {
+        Sid       = "NoSeparatorIn${join("", regexall("[A-Za-z0-9]", title(l)))}"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = local.subscribe_actions
+        Resource  = local.bus_arn
+        Condition = merge(local.exemption, {
+          StringLike = { "aws:PrincipalTag/${local.tag_key[l]}" = "*${var.visibility_separator}*" }
+        })
+      }
+    ],
+
     # --- Allow-list ----------------------------------------------------------
+    # Exceptions only: visibility covers sharing the producer consents to.
     # Literal values on both sides: the owner's path constrains the filter,
     # the consumer's path constrains the caller's tags.
     [

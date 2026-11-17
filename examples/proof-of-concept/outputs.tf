@@ -20,6 +20,26 @@ locals {
     }]
   })
 
+  # The owner's first two levels as an audience: payments.cards.
+  owner_solution = join(".", [for l in slice(var.hierarchy, 0, min(2, length(var.hierarchy))) : local.owner[l]])
+
+  visibility_filter = {
+    for k, v in {
+      solution = [local.owner_solution]
+      public   = ["public"]
+      mixed    = [local.owner_solution, "public"]
+    } : k => jsonencode({ Filters = [{ Scope = "METADATA", Pattern = jsonencode({ visibility = v }) }] })
+  }
+
+  # A permitted filter next to a forbidden one in the same subscriber.
+  # Expected denied; if allowed, a second filter bypasses every subscribe rule.
+  filter_two_filters = jsonencode({
+    Filters = [
+      { Scope = "METADATA", Pattern = jsonencode({ visibility = ["public"] }) },
+      { Scope = "METADATA", Pattern = jsonencode({ for l in var.hierarchy : l => [local.owner[l]] }) },
+    ]
+  })
+
   test_env = {
     REGION               = var.region
     SPOKE_PROFILE        = var.spoke_profile
@@ -38,6 +58,11 @@ locals {
     FILTER_OWNER         = local.filter_for["owner"]
     FILTER_GRANTED       = local.filter_for["granted"]
     FILTER_MISSING_LEVEL = local.owner_filter_missing_level
+    META_OWNER_VISIBLE   = jsonencode(merge(local.owner, { visibility = local.owner_solution }))
+    FILTER_VIS_SOLUTION  = local.visibility_filter["solution"]
+    FILTER_VIS_PUBLIC    = local.visibility_filter["public"]
+    FILTER_VIS_MIXED     = local.visibility_filter["mixed"]
+    FILTER_TWO_FILTERS   = local.filter_two_filters
   }
 }
 

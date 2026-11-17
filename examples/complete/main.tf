@@ -1,7 +1,14 @@
 # One platform account and two workload accounts.
 #
 #   payments account:  authorizer  publishes, and reads its own events
-#   logistics account: tracker     reads authorizer's events through a grant
+#   logistics account: tracker     reads the events the authorizer makes
+#                                  visible to it
+#
+# The authorizer decides who reads each event: it puts an audience namespace
+# in the visibility metadata key of PutRawEvents, for example
+#   visibility = "logistics.delivery.tracking"   (the tracking product)
+#   visibility = "public"                        (the whole organization)
+# Nothing in the central stack changes when producers or consumers change.
 #
 # In a real estate these are three separate stacks owned by three teams.
 # They are shown together so the wiring is visible in one place.
@@ -52,6 +59,24 @@ provider "awscc" {
   profile = var.platform_profile
 }
 
+# Reads Organizations; the bus account cannot. Use the management account or
+# a delegated administrator for AWS Organizations, read-only is enough.
+provider "aws" {
+  alias   = "organization"
+  region  = var.region
+  profile = var.organization_profile
+}
+
+# Each account carries a `platform` tag in AWS Organizations, set when the
+# account is vended. The account vending pipeline re-applies this stack after
+# it creates or retags an account; spokes never need to touch it.
+module "account_platforms" {
+  source    = "../../modules/account-platforms"
+  providers = { aws = aws.organization }
+
+  tag_key = local.hierarchy[0]
+}
+
 module "central_bus" {
   source = "../../modules/central-bus"
   providers = {
@@ -62,17 +87,7 @@ module "central_bus" {
   name            = "org"
   organization_id = var.organization_id
   hierarchy       = local.hierarchy
-
-  platforms = {
-    payments  = { account_ids = [var.payments_account_id] }
-    logistics = { account_ids = [var.logistics_account_id] }
-  }
-
-  # The allow-list. In a real estate, load these from one file per owner
-  # service and make the owning team the required reviewer of its file.
-  grants = [
-    { owner = local.authorizer, consumer = local.tracker },
-  ]
+  platforms       = module.account_platforms.platforms
 }
 
 # --- Payments account: authorizer --------------------------------------------
@@ -107,6 +122,7 @@ module "authorizer" {
   bus_arn         = module.central_bus.bus_arn
   organization_id = var.organization_id
   hierarchy       = module.central_bus.hierarchy
+  visibility      = module.central_bus.visibility
   path            = local.authorizer
 
   vpc_id     = var.payments_vpc_id
@@ -150,6 +166,7 @@ module "tracker" {
   bus_arn         = module.central_bus.bus_arn
   organization_id = var.organization_id
   hierarchy       = module.central_bus.hierarchy
+  visibility      = module.central_bus.visibility
   path            = local.tracker
 
   vpc_id     = var.logistics_vpc_id
@@ -159,6 +176,11 @@ module "tracker" {
   publish            = false
 
   subscriptions = {
-    card-authorizations = { owner = local.authorizer } # allowed by the grant above
+    # Events published with visibility = logistics.delivery.tracking, narrowed
+    # to the authorizer. No grant needed: the producer's metadata is consent.
+    card-authorizations = {
+      visibility = ["logistics.delivery.tracking"]
+      owner      = local.authorizer
+    }
   }
 }

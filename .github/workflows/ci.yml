@@ -36,9 +36,7 @@ jobs:
         dir:
           - modules/central-bus
           - modules/spoke-connection
-          - modules/central-bus-classic
-          - modules/spoke-connection-classic
-          - examples/classic
+          - modules/account-platforms
           - examples/complete
           - examples/deployer-role
           - examples/guardrails

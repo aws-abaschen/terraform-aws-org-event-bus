@@ -5,8 +5,7 @@ platform team, private connectivity from every workload VPC, and attribute-based
 (ABAC) that follows a configurable business hierarchy such as
 **Platform → Solution → Product → Service**.
 
-> **Status: implemented, not yet run against AWS.** Both modules, their
-> [Classic fallback](#fallback-custom-event-bus---classic) and the examples are written
+> **Status: implemented, not yet run against AWS.** The modules and the examples are written
 > and pass `terraform validate` and offline `terraform test`. Nothing has been applied to an AWS
 > account, so the items in [Assumptions to prove](#assumptions-to-prove) are still untested.
 > Run the [proof of concept](examples/proof-of-concept) first. The research behind the design is
@@ -22,22 +21,23 @@ platform team, private connectivity from every workload VPC, and attribute-based
 - [Level 4: one event, end to end](#level-4-one-event-end-to-end)
 - [Access model](#access-model)
 - [Module `central-bus`](#module-central-bus)
+- [Module `account-platforms`](#module-account-platforms)
 - [Module `spoke-connection`](#module-spoke-connection)
 - [Organization guardrails](#organization-guardrails)
 - [Deployment order](#deployment-order)
 - [Testing](#testing)
 - [Limits and costs](#limits-and-costs)
 - [Assumptions to prove](#assumptions-to-prove)
-- [Fallback: Custom Event Bus - Classic](#fallback-custom-event-bus---classic)
 - [Repository layout](#repository-layout)
 
 ## What this repository provides
 
-Two Terraform modules, deployed by two different teams:
+Three Terraform modules, deployed by two different teams:
 
 | Module | Deployed by | Deployed in | Purpose |
 |---|---|---|---|
 | [`modules/central-bus`](#module-central-bus) | Platform team | One event platform account, once per Region | The shared event bus, its organization share, and the generated access policy |
+| [`modules/account-platforms`](#module-account-platforms) | Platform team | Inside the central stack, with a provider that can read AWS Organizations | Builds the Platform account registry from account tags |
 | [`modules/spoke-connection`](#module-spoke-connection) | Each workload team | Each workload account, once per service | Private endpoint to the bus, the workload's tagged IAM role, and its subscriptions |
 
 The rules the two modules enforce together:
@@ -45,8 +45,14 @@ The rules the two modules enforce together:
 1. A workload is a **Service**. Its IAM role carries one tag per hierarchy level.
 2. A Service can **publish** only events stamped with its own hierarchy path.
 3. A Service can **subscribe** to the events it owns.
-4. An owner can **allow-list** other Services to subscribe to its events.
+4. A producer decides **who else may read** each event, by putting an audience namespace such
+   as `payments.cards` in the event's `visibility` metadata. Any Service inside that namespace
+   can subscribe, without any change to the central stack.
 5. The hierarchy itself (level names and depth) is a variable of the central module.
+
+Adding a Service, a producer or a subscription never changes the bus account. Adding an
+account or a Platform changes only account tags, and the account vending pipeline re-applies
+the central stack.
 
 ## Design decisions
 
@@ -56,13 +62,13 @@ The rules the two modules enforce together:
 | Topology | One bus per Region, opened to the organization by its policy, optionally listed through AWS RAM | Matches current AWS guidance. Classic bus-to-bus forwarding is one hop only and caps at 300 rules per bus. |
 | Who owns consumption | Each spoke owns its subscribers, targets and delivery roles | The new bus requires the target to be in the subscriber owner's account, which fits a spoke module. |
 | Hierarchy encoding | One event metadata key and one IAM principal tag per level, same names | The policy compares the two directly, so the hierarchy is data, not code. |
-| Allow-lists | Declared as reviewed data in the central stack, rendered as explicit policy statements | An allow-list is an entitlement, not an attribute match. Tags on the consumer cannot say which producers it may read. |
+| Sharing | The producer sets a `visibility` audience namespace on each event; the bus policy lets a subscriber filter on audiences it belongs to | A subscribe request carries only the caller's tags and its filter, so the producer can consent only in the bus policy or in its events. Consent in the event needs no central change and keeps the policy constant in size. Tags on the consumer cannot express consent: the consumer controls them. |
+| Allow-lists | Optional `grants` in the central stack, for exceptions only | An entitlement the producer cannot express in its events, reviewed centrally. |
 | Endpoints | One interface endpoint per spoke VPC | Lets each spoke carry its own least-privilege endpoint policy. |
 | Terraform resources for the bus | The `awscc` provider (`awscc_eventsv2_event_bus`, `awscc_eventsv2_resource_policy`, `awscc_eventsv2_subscriber`), isolated behind the module interface | `hashicorp/aws` had no resource for the new bus as of 6.73.0. |
 
 The choice of the new bus is the largest bet in this design. It depends on behaviour AWS documents
-but does not demonstrate; see [Assumptions to prove](#assumptions-to-prove) and the
-[Classic fallback](#fallback-custom-event-bus---classic).
+but does not demonstrate; see [Assumptions to prove](#assumptions-to-prove).
 
 ## Level 1: the organization
 
@@ -82,7 +88,7 @@ flowchart TB
 
     subgraph platform["Event platform account - module central-bus"]
       bus[["Central event bus"]]
-      policy["Generated bus policy<br/>publish guardrails + allow-lists"]
+      policy["Generated bus policy<br/>publish guardrails + visibility"]
       share["AWS RAM share<br/>optional, for discovery"]
       policy --- bus
       share --- bus
@@ -155,10 +161,10 @@ flowchart TB
     end
   end
 
-  svcAuth -- "owns and publishes" --> evtAuth{{"payments / cards / issuing / authorizer"}}
+  svcAuth -- "owns and publishes" --> evtAuth{{"producer: payments / cards / issuing / authorizer<br/>visibility: payments.cards"}}
   evtAuth -- "own events" --> svcAuth
-  evtAuth -- "allow-listed by owner" --> svcCase
-  evtAuth -- "allow-listed by owner" --> svcTrack
+  evtAuth -- "inside payments.cards" --> svcCase
+  evtAuth -. "outside the audience" .-x svcTrack
 ```
 
 The same vocabulary appears in three places, and the module keeps them aligned:
@@ -166,7 +172,8 @@ The same vocabulary appears in three places, and the module keeps them aligned:
 | Plane | Carrier | Example |
 |---|---|---|
 | Identity | IAM role tags, read as `aws:PrincipalTag/<level>` | `platform=payments`, `solution=cards`, `product=issuing`, `service=authorizer` |
-| Event | Metadata keys set by the publisher on `PutRawEvents`, read as `events:Metadata/<level>` | same four keys and values |
+| Event, producer | Metadata keys set by the publisher on `PutRawEvents`, read as `events:Metadata/<level>` | same four keys and values |
+| Event, audience | One `visibility` metadata key: a hierarchy path joined with `.`, cut at any level, or `public` | `visibility=payments.cards` |
 | Account | `aws:PrincipalAccount`, checked against the accounts registered for the Platform | `111111111111` belongs to `payments` |
 
 The account check exists because it is the one attribute a team cannot forge: a role in a
@@ -251,25 +258,22 @@ carries the service's hierarchy tags.
 ```mermaid
 sequenceDiagram
   autonumber
-  participant O as Owner team<br/>authorizer
-  participant R as Grants in the central stack<br/>pull request
+  participant O as Producer<br/>authorizer
   participant B as Central event bus
   participant C as Consumer deployment role<br/>tagged as case-manager
   participant Q as Consumer SQS queue
 
-  O->>R: Add grant: case-manager may read authorizer events
-  R->>R: Review, owner team is required approver
-  R->>B: terraform apply renders an Allow statement
-  C->>B: CreateSubscriber with filter on<br/>authorizer's hierarchy path
-  B->>B: Filter names every required level,<br/>exact match only
-  B->>B: Own events, or a grant matching<br/>the caller's tags and this path?
+  O->>B: PutRawEvents with visibility = payments.cards
+  C->>B: CreateSubscriber with filter<br/>visibility = payments.cards
+  B->>B: Filter names visibility, exact match only
+  B->>B: Is every visibility value an audience<br/>of the caller's tags (or public)?
   alt allowed
     B-->>C: Subscriber created
-    B->>Q: Matching events delivered
+    B->>Q: Events published for payments.cards delivered
   else not allowed
     B-->>C: AccessDenied
   end
-  Note over O,B: Removing a grant blocks new subscribers only.<br/>The platform team runs RevokeResource<br/>to stop an existing one.
+  Note over O,B: Narrowing the visibility of new events stops their delivery.<br/>Subscriber rights are checked at create and update only.
 ```
 
 ### How the bus policy decides
@@ -290,7 +294,9 @@ flowchart TD
   filterCheck -- "no" --> deny
   filterCheck -- "yes" --> ownCheck{"Filter values equal<br/>the caller's tags?"}
   ownCheck -- "yes" --> allow
-  ownCheck -- "no" --> grantCheck{"Grant exists for this<br/>caller and this path?"}
+  ownCheck -- "no" --> visCheck{"Filter names visibility,<br/>only the caller's audiences?"}
+  visCheck -- "yes" --> allow
+  visCheck -- "no" --> grantCheck{"Grant exists for this<br/>caller and this path?"}
   grantCheck -- "yes" --> allow
   grantCheck -- "no" --> deny
 
@@ -311,6 +317,7 @@ metadata; the business payload goes in the data.
     "solution": "cards",
     "product": "issuing",
     "service": "authorizer",
+    "visibility": "payments.cards",
     "event-type": "CardAuthorized",
     "event-version": "1"
   },
@@ -324,6 +331,29 @@ metadata; the business payload goes in the data.
 
 The exact request syntax of `PutRawEvents` is not reproduced here; the block shows the logical
 content. `event-type` and `event-version` are conventions of this design, not access attributes.
+
+**Producer namespace.** The four hierarchy keys. The bus policy forces them to equal the
+publisher's tags, so they say who produced the event, and a subscriber can filter on any prefix
+of them.
+
+**Visibility namespace.** The `visibility` key, set freely by the producer: the publish rules
+do not constrain it. Its value names an audience, the hierarchy values joined with `.` and cut
+at any level, or `public` for the whole organization:
+
+| `visibility` | Who may subscribe |
+|---|---|
+| absent | The owner only (and `grants`) |
+| `payments.cards.issuing.authorizer` | The authorizer service |
+| `payments.cards.issuing` | Every service of the issuing product |
+| `payments.cards` | Every service of the cards solution |
+| `payments` | Every service of the payments platform |
+| `logistics.delivery.tracking` | Every service of another platform's product: targeted sharing |
+| `public` | Every principal of the organization |
+
+An event has one visibility value. To reach two disjoint audiences, publish it twice or pick
+their common parent. Filters are exact match, so a subscriber in `payments.cards.disputes`
+lists every audience it wants (`payments`, `payments.cards`, `payments.cards.disputes`,
+`public`): `visibility_audiences` of `spoke-connection` gives that list.
 
 ### Policy statements the central module generates
 
@@ -403,8 +433,44 @@ check closes a documented bypass: without it, a filter that omits a key passes
 }
 ```
 
-**Allow-list.** One statement per grant, with literal values on both sides: the owner's path in
-the filter conditions, the consumer's path in the principal-tag conditions.
+**Subscribe to events made visible to you.** One statement, constant size. Every value the
+filter lists for `visibility` must be one of the caller's audiences: its tags joined at each
+depth, or `public`. Producer keys in the same filter are not constrained; they only narrow what
+is received.
+
+```json
+{
+  "Sid": "SubscribeVisibleEvents",
+  "Effect": "Allow",
+  "Principal": "*",
+  "Action": ["events:CreateSubscriber", "events:UpdateSubscriber"],
+  "Resource": "arn:aws:events:eu-central-1:999999999999:event-busv2/org",
+  "Condition": {
+    "StringEquals": {
+      "aws:PrincipalOrgID": "o-exampleorgid",
+      "events:Metadata/visibility/Matcher": "exact"
+    },
+    "Null": { "events:Metadata/visibility": "false" },
+    "ForAllValues:StringEquals": {
+      "events:Metadata/visibility": [
+        "${aws:PrincipalTag/platform}",
+        "${aws:PrincipalTag/platform}.${aws:PrincipalTag/solution}",
+        "${aws:PrincipalTag/platform}.${aws:PrincipalTag/solution}.${aws:PrincipalTag/product}",
+        "${aws:PrincipalTag/platform}.${aws:PrincipalTag/solution}.${aws:PrincipalTag/product}.${aws:PrincipalTag/service}",
+        "public"
+      ]
+    }
+  }
+}
+```
+
+Because audiences join tag values with `.`, a tag value containing `.` could spell another
+unit's namespace (`solution = "cards.issuing"`). One Deny per level rejects subscribe calls from
+such principals, `spoke-connection` rejects such paths, and `central-bus` rejects such Platform
+names and a Platform named `public`.
+
+**Allow-list (exceptions).** One statement per grant, with literal values on both sides: the
+owner's path in the filter conditions, the consumer's path in the principal-tag conditions.
 
 ```json
 {
@@ -445,11 +511,13 @@ the filter conditions, the consumer's path in the principal-tag conditions.
 
 - **Subscribe rights are not granted through RAM.** RAM managed permissions carry no
   conditions, so a RAM `SubscribeOnly` grant would let any account subscribe to anything. The
-  bus policy grants subscribe, and allow-lists are closed by default.
+  bus policy grants subscribe. Events without `visibility` are private to their owner.
 - **`PutEvents` is denied by default.** That API carries no metadata, so it would bypass the
   hierarchy.
 - **Subscribe checks run at create and update only.** Tightening the policy or removing a grant
-  does not stop an existing subscriber. The bus owner stops one with `RevokeResource`.
+  does not stop an existing subscriber. The bus owner stops one with `RevokeResource`. A
+  producer that narrows the `visibility` of new events stops their delivery to subscribers
+  outside the new audience, since those filter on the old value.
 - **Wider scopes are a filter with fewer keys.** Metadata filters are exact match only. A grant
   on a whole Product is a grant whose `owner` stops at `product`. `own_read_scope` on the bus
   does the same for reading without a grant.
@@ -464,7 +532,9 @@ control policies do not apply there.
 **Creates**
 
 - The event bus, with retention and an optional customer managed KMS key.
-- The bus policy, generated from the hierarchy, the Platform account registry and the grants.
+- The bus policy, generated from the hierarchy, the Platform account registry, the visibility
+  settings and the grants. Its size grows with accounts and grants only, not with services or
+  subscriptions.
   The plan fails if the policy exceeds the size quota.
 - Optionally an AWS RAM share (publish only), which makes the bus discoverable in the
   accounts it is shared with. Access itself comes from the bus policy.
@@ -475,11 +545,14 @@ control policies do not apply there.
 |---|---|---|---|
 | `name` | `string` | required | Bus name. |
 | `organization_id` | `string` | required | Limits every Allow statement to the organization. |
-| `platforms` | `map(object({ account_ids }))` | required | Top-level units and the accounts each one owns. |
+| `platforms` | `map(object({ account_ids }))` | required | Top-level units and the accounts each one owns. Build it from account tags with [`account-platforms`](#module-account-platforms). |
 | `hierarchy` | `list(string)` | `["platform", "solution", "product", "service"]` | Level names, top to bottom. Drives metadata keys, tag keys and conditions. |
 | `tag_key_prefix` | `string` | `""` | Prefix for the IAM tag keys. Metadata keys are never prefixed. |
 | `own_read_scope` | `string` | last level | Level down to which a principal may subscribe without a grant. |
-| `grants` | `list(object({ owner, consumer }))` | `[]` | Allow-list. Both sides are a prefix of the hierarchy, so a grant can name one service or everything below a higher level. |
+| `visibility_key` | `string` | `"visibility"` | Metadata key of the audience namespace. Must not be a level name. |
+| `visibility_separator` | `string` | `"."` | Joins levels into an audience. One character, not a letter, digit, `*`, `?` or `$`. |
+| `visibility_public_value` | `string` | `"public"` | Audience for the whole organization. Null disables it. |
+| `grants` | `list(object({ owner, consumer }))` | `[]` | Allow-list for exceptions. Both sides are a prefix of the hierarchy, so a grant can name one service or everything below a higher level. |
 | `exempt_principal_arns` | `list(string)` | `[]` | Principals exempt from the Deny guardrails (platform operators, forwarders of AWS service events). |
 | `allow_put_events` | `bool` | `false` | Allow the `PutEvents` envelope API, which carries no metadata. |
 | `share_with` | `list(string)` | `[]` | Organization, OU or account principals for the optional RAM share. |
@@ -488,8 +561,8 @@ control policies do not apply there.
 | `policy_size_limit` | `number` | `20480` | Policy size quota in bytes. |
 | `tags` | `map(string)` | `{}` | Tags for the bus and the share. |
 
-**Outputs:** `bus_arn`, `bus_name`, `hierarchy`, `tag_key_prefix`, `tag_keys`, `policy_json`,
-`policy_bytes`, `ram_share_arn`.
+**Outputs:** `bus_arn`, `bus_name`, `hierarchy`, `tag_key_prefix`, `tag_keys`, `visibility`,
+`policy_json`, `policy_bytes`, `ram_share_arn`.
 
 **Example**
 
@@ -507,25 +580,65 @@ module "central_bus" {
     logistics = { account_ids = ["333333333333"] }
   }
 
-  grants = [
-    {
-      # One service to one service.
-      owner    = { platform = "payments", solution = "cards", product = "issuing", service = "authorizer" }
-      consumer = { platform = "payments", solution = "cards", product = "disputes", service = "case-manager" }
-    },
-    {
-      # A whole product to a whole platform.
-      owner    = { platform = "payments", solution = "cards", product = "issuing" }
-      consumer = { platform = "logistics" }
-    },
-  ]
+  # Optional: exceptions a producer cannot express with visibility.
+  grants = []
 }
 ```
 
-**How owners allow-list consumers.** Keep grants as files in the central stack (for example one
-YAML file per owner service under `grants/`) and load them into `grants`. A `CODEOWNERS` entry
-makes the owning team the required reviewer of its own file. The pull request is the approval
-workflow; EventBridge has none of its own.
+**Grants are for exceptions.** Producers share through `visibility`. Keep `grants` for an
+entitlement that must be reviewed centrally, as files in the central stack with the owning team
+as required reviewer.
+
+## Module `account-platforms`
+
+Builds `platforms` for `central-bus` from a tag on each AWS account (AWS Organizations account
+tags), so that no account list is maintained by hand. IAM has no condition key for account
+tags, so the bus policy cannot read them directly: this module turns them into the account
+list the policy checks (`Accounts<Platform>` and `DenyUnregistered<Platform>` statements).
+
+Run it inside the central stack with a provider that can read AWS Organizations: the
+management account, or a delegated administrator for Organizations. Tag each account when it is
+vended (for example `platform = payments`), and make the last step of the account vending
+pipeline re-apply the central stack. Adding an account, or a new top-level unit, then needs no
+manual change to the bus stack. Adding producers or subscribers in an existing account needs
+no change to the bus stack at all.
+
+Only `ACTIVE` accounts are read. Accounts without the tag are left out and listed in
+`untagged_account_ids`: their principals can neither publish nor subscribe. Every account adds
+about 16 bytes to the bus policy, against its size quota.
+
+Account tags are trusted as much as the people who can change them. Restrict
+`organizations:TagResource` and `organizations:UntagResource` on accounts to the vending role.
+
+**Inputs**
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `tag_key` | `string` | `"platform"` | Account tag whose value names the top-level unit. |
+| `parent_id` | `string` | `null` | Root or OU whose accounts, at any depth, are read. Null reads the whole organization. |
+| `allowed_values` | `list(string)` | `[]` | If set, a tag value outside the list fails the plan instead of creating a new unit. |
+
+**Outputs:** `platforms`, `untagged_account_ids`.
+
+**Example**
+
+```hcl
+provider "aws" {
+  alias   = "organization"
+  profile = "management-readonly"
+}
+
+module "account_platforms" {
+  source    = "github.com/aws-abaschen/terraform-aws-org-event-bus//modules/account-platforms"
+  providers = { aws = aws.organization }
+}
+
+module "central_bus" {
+  source = "github.com/aws-abaschen/terraform-aws-org-event-bus//modules/central-bus"
+  # ...
+  platforms = module.account_platforms.platforms
+}
+```
 
 ## Module `spoke-connection`
 
@@ -569,13 +682,17 @@ service's workload role and nothing else. See `examples/deployer-role`.
 | `assume_role_policy` | `string` | `null` | Trust policy of the workload role. Must not allow `sts:TagSession`. |
 | `permissions_boundary` | `string` | `null` | Boundary for the roles the module creates. |
 | `publish` | `bool` | `true` | Allow the workload role to publish. |
-| `subscriptions` | `map(object)` | `{}` | Per subscription: optional `owner` path prefix (default: this service), `transformer_type` (`WITH_METADATA` or `RAW`), queue timings. |
+| `visibility` | `object({ key, separator, public_value })` | same defaults as `central-bus` | Output `visibility` of `central-bus`. |
+| `subscriptions` | `map(object)` | `{}` | Per subscription: optional `visibility` (list of audiences this service belongs to), optional `owner` path prefix (default: this service when `visibility` is not set, otherwise a narrowing), `transformer_type` (`WITH_METADATA` or `RAW`), queue timings. |
 | `tags` | `map(string)` | `{}` | Tags for every resource. |
 
-Subscribing to another owner's events succeeds only if the central stack holds a matching
-grant.
+A subscription with `visibility` receives every event whose producer set one of the listed
+audiences, from any producer, unless `owner` narrows it. The module rejects audiences the
+service does not belong to. Subscribing to another owner's events by `owner` alone succeeds
+only if the central stack holds a matching grant.
 
-**Outputs:** `role_arn`, `role_name`, `hierarchy_tags`, `event_metadata`, `events_endpoint_id`,
+**Outputs:** `role_arn`, `role_name`, `hierarchy_tags`, `event_metadata`, `visibility_audiences`,
+`events_endpoint_id`,
 `sqs_endpoint_id`, `endpoint_security_group_id`, `queue_arns`, `queue_urls`,
 `dead_letter_queue_arns`, `subscriber_arns`.
 
@@ -610,9 +727,13 @@ module "event_bus_connection" {
   assume_role_policy = data.aws_iam_policy_document.ecs_trust.json
 
   subscriptions = {
-    own            = {}
+    own = {}
+    # Everything producers made visible to the cards solution or to everyone.
+    shared = { visibility = ["payments.cards", "public"] }
+    # The same, narrowed to one producer.
     authorizations = {
-      owner = { platform = "payments", solution = "cards", product = "issuing", service = "authorizer" }
+      visibility = ["payments.cards"]
+      owner      = { platform = "payments", solution = "cards", product = "issuing", service = "authorizer" }
     }
   }
 }
@@ -637,13 +758,16 @@ subject to the session-tag statement in the same way; make sure the identity pro
 pass hierarchy keys as session tags.
 
 Organizations account tags are not visible to IAM, which is why the hierarchy is copied onto
-roles and the account-to-Platform mapping is passed to `central-bus` explicitly.
+roles. The account-to-Platform mapping is read from account tags by `account-platforms` at plan
+time and written into the bus policy.
 
 ## Deployment order
 
 1. **Proof of concept** (`examples/proof-of-concept`): two accounts, confirms the access model.
 2. **Guardrails** (`examples/guardrails`): from the management account, before any spoke.
-3. **Central bus** (`modules/central-bus`): in the event platform account.
+3. **Central bus** (`modules/central-bus` with `modules/account-platforms`): in the event
+   platform account. Re-applied by the account vending pipeline after each new or retagged
+   account.
 4. **Deployment role per service** (`examples/deployer-role`): by the provisioning role.
 5. **Spoke connection per service** (`modules/spoke-connection`): by each service's deployment
    role. `examples/complete` shows steps 3 and 5 wired together.
@@ -652,8 +776,8 @@ roles and the account-to-Platform mapping is passed to `central-bus` explicitly.
 
 | What | How | Proves |
 |---|---|---|
-| Module logic | `terraform test` in each of the four directories under `modules/` | The generated policy, tags, filters, rules and endpoint are what the design says. Offline, mocked providers. |
-| Access model | `examples/proof-of-concept` (`terraform apply`, then `./run-tests.sh`) | AWS evaluates the policy as intended, across two accounts. Twelve allow and deny cases. |
+| Module logic | `terraform test` in each of the three directories under `modules/` | The generated policy, tags, filters, rules and endpoint are what the design says. Offline, mocked providers. |
+| Access model | `examples/proof-of-concept` (`terraform apply`, then `./run-tests.sh`) | AWS evaluates the policy as intended, across two accounts. Eighteen allow and deny cases, including visibility and the two-filter bypass. |
 
 The offline checks (format, `terraform validate` on every module and example, and the module
 tests) run with `just test`, or `just win::test` in PowerShell on Windows. The `ci` GitHub
@@ -670,7 +794,7 @@ Figures from the research report; confirm against the live AWS pages before rely
 
 | Item | Value |
 |---|---|
-| Bus policy size | 20,480 bytes, adjustable. Roughly 40 to 55 grant statements at this design's statement size. |
+| Bus policy size | 20,480 bytes, adjustable. About 16 bytes per registered account, and roughly 400 bytes per grant. Services and subscriptions add nothing. |
 | Subscribers per bus | 10,000 by default. |
 | Buses of this type per account | 5 by default. |
 | Throughput | 500,000 events per second per bus. |
@@ -680,9 +804,7 @@ Figures from the research report; confirm against the live AWS pages before rely
 | Pricing | Per GB: publishers pay ingress, subscribers pay egress. |
 | Interface endpoint | Billed per endpoint, per Availability Zone, per hour, plus data. |
 
-The policy size is the scaling limit of the allow-list. Past it, grants move out of the bus
-policy into a control plane that creates subscribers on behalf of consumers. That is out of
-scope for this version.
+The policy size limits the number of accounts and grants. Visibility sharing does not use it.
 
 ## Assumptions to prove
 
@@ -692,56 +814,14 @@ with each:
 | # | Assumption | If it fails |
 |---|---|---|
 | 1 | `events:Metadata/<key>` can be compared with `${aws:PrincipalTag/<key>}` on `PutRawEvents`, `CreateSubscriber` and `UpdateSubscriber`, in a bus policy, for callers in other accounts. AWS's policy language permits it; no AWS example shows it. | Fall back to literal per-service statements keyed on `aws:PrincipalAccount`, or a publish API that stamps metadata from the caller's identity. |
-| 2 | The bus policy size fits the expected number of grants. | Bring the control plane forward. |
+| 2 | The bus policy size fits the expected number of accounts and grants. | Request a quota increase, or move grants to a control plane that creates subscribers on behalf of consumers. |
 | 3 | The `eventsv2` interface endpoint supports endpoint policies. | Set `enable_endpoint_policy = false`; rely on identity and bus policies. |
-| 4 | The bus is available in the target Region. | Use the Classic fallback in that Region. |
+| 4 | The bus is available in the target Region. | Wait for the Region, or run the bus in a supported Region. |
 | 5 | Terraform can create several subscribers in one apply despite the one-at-a-time rule. | Apply the spoke with `-parallelism=1`. |
 | 6 | The tag-inheritance SCP (a policy variable compared with `aws:RequestTag`) behaves as written. | Restrict tagging to the provisioning roles only and have them create the workload roles. |
-
-## Fallback: Custom Event Bus - Classic
-
-If assumption 1 or 4 fails, use the same two-module split on a Classic bus:
-[`modules/central-bus-classic`](modules/central-bus-classic) and
-[`modules/spoke-connection-classic`](modules/spoke-connection-classic), wired together in
-[`examples/classic`](examples/classic). Like the rest of this repository they pass
-`terraform validate` and offline tests and have not been applied.
-
-What changes against the main design:
-
-| | Custom Event Bus | Classic fallback |
-|---|---|---|
-| Hierarchy on the event | One metadata key per level | One `source` string, levels joined with a separator: `payments.cards.issuing.authorizer` |
-| Publish rule | Each metadata key equals the caller's tag | `events:source` equals the caller's tags joined, in the bus policy and again in the workload role |
-| Who creates a subscription | The consuming service, in its own account | The platform team: every rule lives in the bus account |
-| Allow-list | `grants` in the bus policy | `subscriptions` of `central-bus-classic`; the reviewed entry is the entitlement |
-| Own events | Self-service | Also a `subscriptions` entry |
-| Delivery | Subscriber and delivery role in the spoke | Rule with a direct cross-account SQS target, sent with one delivery role in the bus account |
-| Scaling limit | Bus policy size | 300 rules per bus, one per subscription |
-| Endpoint service | `eventsv2` | `events` |
-| Providers | `aws` and `awscc` | `aws` only |
-
-Rules 2 and 4 of [What this repository provides](#what-this-repository-provides) hold. Rule 3
-weakens: a service cannot subscribe on its own, not even to its own events.
-
-Deployment order for the fallback:
-
-1. `central-bus-classic` without subscriptions. It outputs `bus_arn` and `delivery_role_arn`.
-2. `spoke-connection-classic` per service. A consumer declares `queues`; each queue policy
-   admits the central delivery role. It outputs `queue_arns`.
-3. `central-bus-classic` again, with one `subscriptions` entry per queue. The module refuses a
-   target queue outside the accounts of the consumer's top-level unit.
-
-Because the levels are joined into one string, no hierarchy value may contain the separator.
-The modules reject such values in their inputs, and the bus policy denies any principal whose
-tag contains it.
-
-Still to prove on a Classic bus, before relying on the fallback:
-
-| # | Assumption | If it fails |
-|---|---|---|
-| C1 | `events:source` can be compared with a string built from several `${aws:PrincipalTag/<key>}` variables in a bus policy, for callers in other accounts. | Generate one literal Allow per service keyed on `aws:PrincipalAccount` and its source. |
-| C2 | A rule can deliver straight to an SQS queue in another account with a role in the bus account. | Forward to a bus in the consumer account and attach the queue there. |
-| C3 | The bus policy accepts Deny statements with `Principal: "*"`. | Drop the Deny guardrails; the Allow on `events:source` alone still binds publishers to their tags. |
+| 7 | A metadata key outside the hierarchy (`visibility`) can be filtered on and used as `events:Metadata/visibility`, and one condition value can join several `${aws:PrincipalTag/...}` variables. When a tag is missing, only that value fails to match. | Use one visibility key per level, each compared with a single tag variable, or fall back to `grants`. |
+| 8 | Every filter of a subscriber is checked: a second filter cannot add keys the policy would refuse. | Create subscribers through a control plane on the consumers' behalf. |
+| 9 | Subscriber read, delete and tag calls during a Terraform lifecycle are authorized by the spoke's identity policy, not by the bus policy. | Add those actions to the bus policy statements, or replacements need the platform team. |
 
 ## Repository layout
 
@@ -754,16 +834,13 @@ Still to prove on a Classic bus, before relying on the fallback:
 ├── docs/
 │   └── research-eventbridge-org-level.md
 ├── modules/
+│   ├── account-platforms/    # account tags -> platforms input of central-bus
+│   │   └── tests/
 │   ├── central-bus/          # bus, generated policy, optional RAM share
 │   │   └── tests/
-│   ├── spoke-connection/     # endpoints, workload role, subscriptions
-│   │   └── tests/
-│   ├── central-bus-classic/  # fallback: Classic bus, policy, rules, delivery role
-│   │   └── tests/
-│   └── spoke-connection-classic/  # fallback: endpoints, workload role, queues
+│   └── spoke-connection/     # endpoints, workload role, subscriptions
 │       └── tests/
 └── examples/
-    ├── classic/              # the fallback, wired like complete
     ├── complete/             # one platform account, two workload accounts
     ├── deployer-role/        # tagged deployment role for one service
     ├── guardrails/           # SCP, RCP and tag policy

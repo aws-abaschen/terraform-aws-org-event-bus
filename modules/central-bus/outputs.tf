@@ -23,6 +23,15 @@ output "tag_keys" {
   value       = [for l in var.hierarchy : local.tag_key[l]]
 }
 
+output "visibility" {
+  description = "Visibility settings. Pass key, separator and public_value to spoke-connection unchanged."
+  value = {
+    key          = var.visibility_key
+    separator    = var.visibility_separator
+    public_value = var.visibility_public_value
+  }
+}
+
 output "policy_json" {
   description = "The generated bus policy."
   value       = local.policy_json

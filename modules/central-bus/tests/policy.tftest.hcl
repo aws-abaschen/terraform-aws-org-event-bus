@@ -51,6 +51,11 @@ run "default_hierarchy" {
       "PublishOwnProductOnly",
       "PublishOwnServiceOnly",
       "SubscribeOwnEvents",
+      "SubscribeVisibleEvents",
+      "NoSeparatorInPlatform",
+      "NoSeparatorInSolution",
+      "NoSeparatorInProduct",
+      "NoSeparatorInService",
       "Grant0",
       "Grant1",
     ])
@@ -110,6 +115,35 @@ run "default_hierarchy" {
   }
 
   assert {
+    condition = jsonencode(one([
+      for s in jsondecode(output.policy_json).Statement : s if s.Sid == "SubscribeVisibleEvents"
+      ]).Condition) == jsonencode({
+      Null = { "events:Metadata/visibility" = "false" }
+      StringEquals = {
+        "aws:PrincipalOrgID"                 = "o-a1b2c3d4e5"
+        "events:Metadata/visibility/Matcher" = "exact"
+      }
+      "ForAllValues:StringEquals" = {
+        "events:Metadata/visibility" = [
+          "$${aws:PrincipalTag/platform}",
+          "$${aws:PrincipalTag/platform}.$${aws:PrincipalTag/solution}",
+          "$${aws:PrincipalTag/platform}.$${aws:PrincipalTag/solution}.$${aws:PrincipalTag/product}",
+          "$${aws:PrincipalTag/platform}.$${aws:PrincipalTag/solution}.$${aws:PrincipalTag/product}.$${aws:PrincipalTag/service}",
+          "public",
+        ]
+      }
+    })
+    error_message = "Visibility subscriptions must require an exact visibility filter naming only the caller's audiences."
+  }
+
+  assert {
+    condition = jsonencode(one([
+      for s in jsondecode(output.policy_json).Statement : s if s.Sid == "NoSeparatorInSolution"
+    ]).Condition) == jsonencode({ StringLike = { "aws:PrincipalTag/solution" = "*.*" } })
+    error_message = "Tag values containing the separator must be denied."
+  }
+
+  assert {
     condition     = output.ram_share_arn == null
     error_message = "No RAM share expected when share_with is empty."
   }
@@ -125,6 +159,10 @@ run "custom_hierarchy_prefix_and_scope" {
     platforms             = { retail = { account_ids = ["111111111111"] } }
     grants                = []
     exempt_principal_arns = ["arn:aws:iam::999999999999:role/platform-ops"]
+
+    visibility_key          = "audience"
+    visibility_separator    = ":"
+    visibility_public_value = null
   }
 
   assert {
@@ -145,6 +183,17 @@ run "custom_hierarchy_prefix_and_scope" {
       "events:Metadata/team"   = "$${aws:PrincipalTag/evt-team}"
     }
     error_message = "own_read_scope = team must stop the required levels at team."
+  }
+
+  assert {
+    condition = jsonencode(one([
+      for s in jsondecode(output.policy_json).Statement : s if s.Sid == "SubscribeVisibleEvents"
+      ]).Condition["ForAllValues:StringEquals"]["events:Metadata/audience"]) == jsonencode([
+      "$${aws:PrincipalTag/evt-domain}",
+      "$${aws:PrincipalTag/evt-domain}:$${aws:PrincipalTag/evt-team}",
+      "$${aws:PrincipalTag/evt-domain}:$${aws:PrincipalTag/evt-team}:$${aws:PrincipalTag/evt-app}",
+    ])
+    error_message = "Custom key, separator, tag prefix and a disabled public value must shape the audiences."
   }
 
   assert {
@@ -174,4 +223,28 @@ run "rejects_oversized_policy" {
   }
 
   expect_failures = [awscc_eventsv2_resource_policy.this]
+}
+
+run "rejects_platform_spelling_an_audience" {
+  command = plan
+
+  variables {
+    platforms = {
+      "payments.cards" = { account_ids = ["111111111111"] }
+      public           = { account_ids = ["222222222222"] }
+    }
+    grants = []
+  }
+
+  expect_failures = [awscc_eventsv2_resource_policy.this]
+}
+
+run "rejects_visibility_key_that_is_a_level" {
+  command = plan
+
+  variables {
+    visibility_key = "product"
+  }
+
+  expect_failures = [var.visibility_key]
 }

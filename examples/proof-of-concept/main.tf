@@ -78,6 +78,29 @@ locals {
       }
     ],
 
+    # Assumption 1c: subscribe to events the producer made visible to an
+    # audience the caller belongs to. visibility is not a hierarchy level, and
+    # each audience joins several tag variables in one value.
+    [
+      {
+        Sid       = "SubscribeVisibleEvents"
+        Effect    = "Allow"
+        Principal = { AWS = local.spoke_root }
+        Action    = local.subscribe_actions
+        Resource  = local.bus_arn
+        Condition = {
+          Null         = { "events:Metadata/visibility" = "false" }
+          StringEquals = { "events:Metadata/visibility/Matcher" = "exact" }
+          "ForAllValues:StringEquals" = {
+            "events:Metadata/visibility" = concat(
+              [for d in range(1, length(var.hierarchy) + 1) : join(".", [for l in slice(var.hierarchy, 0, d) : "$${aws:PrincipalTag/${l}}"])],
+              ["public"],
+            )
+          }
+        }
+      }
+    ],
+
     # Allow-list: literal owner path in the filter, literal consumer path in
     # the principal tags.
     [

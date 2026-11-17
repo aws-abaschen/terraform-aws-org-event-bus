@@ -10,8 +10,35 @@ locals {
   # IAM tags that carry the hierarchy path.
   hierarchy_tags = { for l in var.hierarchy : "${var.tag_key_prefix}${l}" => var.path[l] }
 
-  # Resolved owner path per subscription; defaults to this service.
-  owners = { for k, s in var.subscriptions : k => coalesce(s.owner, var.path) }
+  # Audiences this service belongs to: its path cut at every level, then the
+  # organization-wide value. The bus policy allows exactly these.
+  visibility_audiences = concat(
+    [for d in range(1, length(var.hierarchy) + 1) : join(var.visibility.separator, [for l in slice(var.hierarchy, 0, d) : var.path[l]])],
+    var.visibility.public_value == null ? [] : [var.visibility.public_value],
+  )
+
+  # Owner path per subscription. Without visibility it defaults to this
+  # service; with visibility it is only an optional narrowing.
+  owners = {
+    for k, s in var.subscriptions : k => (
+      s.owner != null ? s.owner : s.visibility == null ? var.path : {}
+    )
+  }
+
+  # Exact match on every level the owner path names, and on the audiences.
+  filter_patterns = {
+    for k, s in var.subscriptions : k => merge(
+      { for l in var.hierarchy : l => [local.owners[k][l]] if contains(keys(local.owners[k]), l) },
+      s.visibility == null ? {} : { (var.visibility.key) = s.visibility },
+    )
+  }
+
+  descriptions = {
+    for k, s in var.subscriptions : k => join(", ", compact([
+      length(local.owners[k]) == 0 ? "" : "events of ${join("/", [for l in var.hierarchy : local.owners[k][l] if contains(keys(local.owners[k]), l)])}",
+      s.visibility == null ? "" : "visible to ${join(" or ", s.visibility)}",
+    ]))
+  }
 
   queue_arns = concat(
     [for q in aws_sqs_queue.subscription : q.arn],
@@ -206,24 +233,21 @@ resource "aws_iam_role_policy" "delivery" {
 }
 
 # The bus policy authorizes this call against the caller's principal tags and
-# the METADATA filter below. The target and the delivery role must be in this
+# the METADATA filter below: own events, events made visible to an audience
+# the caller belongs to, or a grant. The target and the delivery role must be in this
 # account. The bus runs one subscriber create or delete at a time across all
 # accounts; apply with -parallelism=1 if creates collide.
 resource "awscc_eventsv2_subscriber" "this" {
   for_each = var.subscriptions
 
   name          = "${var.name}-${each.key}"
-  description   = "Events of ${join("/", [for l in var.hierarchy : local.owners[each.key][l] if contains(keys(local.owners[each.key]), l)])}"
+  description   = local.descriptions[each.key]
   event_bus_arn = var.bus_arn
 
   filter_configuration = {
     filters = [{
-      scope = "METADATA"
-      # Exact match on every level the owner path names.
-      pattern = jsonencode({
-        for l in var.hierarchy : l => [local.owners[each.key][l]]
-        if contains(keys(local.owners[each.key]), l)
-      })
+      scope   = "METADATA"
+      pattern = jsonencode(local.filter_patterns[each.key])
     }]
   }
 

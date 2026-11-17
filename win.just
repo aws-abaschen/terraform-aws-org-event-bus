@@ -1,8 +1,8 @@
 # Windows recipes in PowerShell 7: just win::<task> (or just win <task>)
 set shell := ["pwsh", "-NoLogo", "-NoProfile", "-Command"]
 
-modules := "modules/central-bus modules/spoke-connection modules/central-bus-classic modules/spoke-connection-classic"
-examples := "examples/classic examples/complete examples/deployer-role examples/guardrails examples/proof-of-concept"
+modules := "modules/account-platforms modules/central-bus modules/spoke-connection"
+examples := "examples/complete examples/deployer-role examples/guardrails examples/proof-of-concept"
 
 default:
     @just --list win

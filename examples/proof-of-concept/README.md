@@ -27,6 +27,7 @@ the calls on its own and the bus policy's Allow statements would not be tested.
 | Owner publishes with another service name | denied |
 | Owner publishes without the last level | denied |
 | Stranger publishes as the owner | denied |
+| Owner publishes its own path with a `visibility` key | allowed |
 | Owner publishes with `PutEvents` (no metadata) | denied |
 | Owner subscribes to its own events | allowed |
 | Granted consumer subscribes to the owner's events | allowed |
@@ -34,6 +35,11 @@ the calls on its own and the bus policy's Allow statements would not be tested.
 | Stranger subscribes to the owner's events | denied |
 | Granted consumer omits the last level from its filter | denied |
 | Stranger subscribes with no filter | denied |
+| Granted consumer (same solution) subscribes to `visibility = payments.cards` | allowed |
+| Stranger (other platform) subscribes to `visibility = payments.cards` | denied |
+| Stranger subscribes to `visibility = public` | allowed |
+| Stranger subscribes to `visibility` in `payments.cards` or `public` | denied |
+| Stranger adds a second filter naming the owner's path next to a `public` one | denied |
 | Stranger passes a session tag to override its role tag | denied |
 
 A case that fails for any other reason (throttling, validation, an old CLI) is reported as
@@ -67,6 +73,12 @@ The script deletes the subscribers it created. State is local; do not commit it.
 - **All pass:** the tag-variable design holds across accounts. Build the modules as designed.
 - **Publish cases fail:** `events:Metadata/<key>` cannot be compared with
   `${aws:PrincipalTag/<key>}` on `PutRawEvents`. Use the fallback in the design README.
+- **Only visibility cases fail:** a metadata key outside the hierarchy, or a condition value
+  joining several tag variables, does not work. Fall back to `grants`, or to one visibility key
+  per level compared with a single tag variable each.
+- **The two-filter case is allowed:** a subscriber's filters are not all checked, so a second
+  filter bypasses every subscribe rule. Subscribers must then be created by a control plane on
+  the consumers' behalf.
 - **Only subscribe cases fail:** the variable works for single values but not with
   `ForAllValues` on subscriber filters. Own-event subscriptions then need one literal statement
   per service, which brings the policy size limit forward.
