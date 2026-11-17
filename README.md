@@ -5,7 +5,8 @@ platform team, private connectivity from every workload VPC, and attribute-based
 (ABAC) that follows a configurable business hierarchy such as
 **Platform → Solution → Product → Service**.
 
-> **Status: implemented, not yet run against AWS.** Both modules and the examples are written
+> **Status: implemented, not yet run against AWS.** Both modules, their
+> [Classic fallback](#fallback-custom-event-bus---classic) and the examples are written
 > and pass `terraform validate` and offline `terraform test`. Nothing has been applied to an AWS
 > account, so the items in [Assumptions to prove](#assumptions-to-prove) are still untested.
 > Run the [proof of concept](examples/proof-of-concept) first. The research behind the design is
@@ -651,11 +652,17 @@ roles and the account-to-Platform mapping is passed to `central-bus` explicitly.
 
 | What | How | Proves |
 |---|---|---|
-| Module logic | `terraform test` in `modules/central-bus` and `modules/spoke-connection` | The generated policy, tags, filters and endpoint are what the design says. Offline, mocked providers. |
+| Module logic | `terraform test` in each of the four directories under `modules/` | The generated policy, tags, filters, rules and endpoint are what the design says. Offline, mocked providers. |
 | Access model | `examples/proof-of-concept` (`terraform apply`, then `./run-tests.sh`) | AWS evaluates the policy as intended, across two accounts. Twelve allow and deny cases. |
 
+The offline checks (format, `terraform validate` on every module and example, and the module
+tests) run with `just test`, or `just win::test` in PowerShell on Windows. The `ci` GitHub
+Actions workflow runs the same checks on every pull request and on `main`. They need no AWS
+credentials.
+
 The module tests pass. The proof of concept has not been run: nothing in this repository has
-been applied to an AWS account yet.
+been applied to an AWS account yet. Running it needs two accounts in one organization and an
+AWS CLI recent enough to have the `eventsv2` command.
 
 ## Limits and costs
 
@@ -693,31 +700,70 @@ with each:
 
 ## Fallback: Custom Event Bus - Classic
 
-If assumption 1 or 4 fails, the same two-module interface can be implemented on a Classic bus,
-with weaker guarantees:
+If assumption 1 or 4 fails, use the same two-module split on a Classic bus:
+[`modules/central-bus-classic`](modules/central-bus-classic) and
+[`modules/spoke-connection-classic`](modules/spoke-connection-classic), wired together in
+[`examples/classic`](examples/classic). Like the rest of this repository they pass
+`terraform validate` and offline tests and have not been applied.
 
-- The hierarchy collapses into one dotted `source` string, for example
-  `payments.cards.issuing.authorizer`, enforced with a prefix condition on `events:source`.
-- Consumption uses rules on the central bus with direct cross-account targets, so the platform
-  account owns every rule (300 rules per bus, 5 targets per rule).
-- The interface endpoint is `events` instead of `eventsv2`.
-- Native `hashicorp/aws` resources cover everything.
+What changes against the main design:
 
-This fallback is not implemented.
+| | Custom Event Bus | Classic fallback |
+|---|---|---|
+| Hierarchy on the event | One metadata key per level | One `source` string, levels joined with a separator: `payments.cards.issuing.authorizer` |
+| Publish rule | Each metadata key equals the caller's tag | `events:source` equals the caller's tags joined, in the bus policy and again in the workload role |
+| Who creates a subscription | The consuming service, in its own account | The platform team: every rule lives in the bus account |
+| Allow-list | `grants` in the bus policy | `subscriptions` of `central-bus-classic`; the reviewed entry is the entitlement |
+| Own events | Self-service | Also a `subscriptions` entry |
+| Delivery | Subscriber and delivery role in the spoke | Rule with a direct cross-account SQS target, sent with one delivery role in the bus account |
+| Scaling limit | Bus policy size | 300 rules per bus, one per subscription |
+| Endpoint service | `eventsv2` | `events` |
+| Providers | `aws` and `awscc` | `aws` only |
+
+Rules 2 and 4 of [What this repository provides](#what-this-repository-provides) hold. Rule 3
+weakens: a service cannot subscribe on its own, not even to its own events.
+
+Deployment order for the fallback:
+
+1. `central-bus-classic` without subscriptions. It outputs `bus_arn` and `delivery_role_arn`.
+2. `spoke-connection-classic` per service. A consumer declares `queues`; each queue policy
+   admits the central delivery role. It outputs `queue_arns`.
+3. `central-bus-classic` again, with one `subscriptions` entry per queue. The module refuses a
+   target queue outside the accounts of the consumer's top-level unit.
+
+Because the levels are joined into one string, no hierarchy value may contain the separator.
+The modules reject such values in their inputs, and the bus policy denies any principal whose
+tag contains it.
+
+Still to prove on a Classic bus, before relying on the fallback:
+
+| # | Assumption | If it fails |
+|---|---|---|
+| C1 | `events:source` can be compared with a string built from several `${aws:PrincipalTag/<key>}` variables in a bus policy, for callers in other accounts. | Generate one literal Allow per service keyed on `aws:PrincipalAccount` and its source. |
+| C2 | A rule can deliver straight to an SQS queue in another account with a role in the bus account. | Forward to a bus in the consumer account and attach the queue there. |
+| C3 | The bus policy accepts Deny statements with `Principal: "*"`. | Drop the Deny guardrails; the Allow on `events:source` alone still binds publishers to their tags. |
 
 ## Repository layout
 
 ```text
 .
 ├── README.md
+├── justfile                  # offline checks: fmt, validate, test
+├── win.just                  # the same tasks for PowerShell
+├── .github/workflows/ci.yml  # runs the offline checks
 ├── docs/
 │   └── research-eventbridge-org-level.md
 ├── modules/
 │   ├── central-bus/          # bus, generated policy, optional RAM share
 │   │   └── tests/
-│   └── spoke-connection/     # endpoints, workload role, subscriptions
+│   ├── spoke-connection/     # endpoints, workload role, subscriptions
+│   │   └── tests/
+│   ├── central-bus-classic/  # fallback: Classic bus, policy, rules, delivery role
+│   │   └── tests/
+│   └── spoke-connection-classic/  # fallback: endpoints, workload role, queues
 │       └── tests/
 └── examples/
+    ├── classic/              # the fallback, wired like complete
     ├── complete/             # one platform account, two workload accounts
     ├── deployer-role/        # tagged deployment role for one service
     ├── guardrails/           # SCP, RCP and tag policy
