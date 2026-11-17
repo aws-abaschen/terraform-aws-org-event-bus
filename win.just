@@ -17,3 +17,14 @@ validate:
 # validate, then the mocked-provider tests of both modules
 test: validate
     foreach ($dir in '{{modules}}'.Split(' ')) { "== $dir"; terraform "-chdir=$dir" test; if ($LASTEXITCODE) { exit 1 } }
+
+# TFLint with the AWS ruleset
+lint:
+    tflint --init; if ($LASTEXITCODE) { exit 1 }; tflint --recursive --format compact
+
+# Checkov and Trivy: AWS best-practice and security checks (pip install checkov==3.4.5)
+scan:
+    $env:PYTHONIOENCODING = 'utf-8'; python -m checkov.main --config-file .checkov.yaml; if ($LASTEXITCODE) { exit 1 }; trivy config --exit-code 1 --severity LOW,MEDIUM,HIGH,CRITICAL --skip-dirs .terraform .
+
+# Everything CI runs
+check: test lint scan

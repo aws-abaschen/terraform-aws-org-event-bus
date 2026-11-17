@@ -17,6 +17,11 @@ locals {
     [for q in aws_sqs_queue.subscription : q.arn],
     [for q in aws_sqs_queue.dead_letter : q.arn],
   )
+
+  # Customer managed key for the queues: the one passed in, else the one this
+  # module creates. Null only when there are no subscriptions.
+  create_key = var.kms_key_arn == null && var.create_kms_key && length(var.subscriptions) > 0
+  key_arn    = var.kms_key_arn != null ? var.kms_key_arn : try(aws_kms_key.queues[0].arn, null)
 }
 
 # --- Network -----------------------------------------------------------------
@@ -146,8 +151,48 @@ resource "aws_iam_role_policy" "workload" {
           Resource = local.queue_arns
         }] : s if length(var.subscriptions) > 0
       ],
+      [
+        for s in [{
+          Sid      = "DecryptSubscriptionQueues"
+          Effect   = "Allow"
+          Action   = "kms:Decrypt"
+          Resource = local.key_arn
+        }] : s if length(var.subscriptions) > 0
+      ],
     )
   })
+}
+
+# --- Encryption --------------------------------------------------------------
+
+# One key for every queue of this service. Only this account's IAM controls it:
+# the root statement hands access to identity policies, which grant the
+# delivery role (GenerateDataKey) and the workload role (Decrypt) below.
+resource "aws_kms_key" "queues" {
+  count = local.create_key ? 1 : 0
+
+  description             = "Subscription queues of ${var.name}"
+  enable_key_rotation     = true
+  deletion_window_in_days = 30
+  tags                    = var.tags
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "EnableIAMPolicies"
+      Effect    = "Allow"
+      Principal = { AWS = "arn:${local.partition}:iam::${local.account}:root" }
+      Action    = "kms:*"
+      Resource  = "*"
+    }]
+  })
+}
+
+resource "aws_kms_alias" "queues" {
+  count = local.create_key ? 1 : 0
+
+  name          = "alias/${var.name}-event-queues"
+  target_key_id = aws_kms_key.queues[0].key_id
 }
 
 # --- Subscriptions -----------------------------------------------------------
@@ -158,8 +203,15 @@ resource "aws_sqs_queue" "subscription" {
   name                       = "${var.name}-${each.key}"
   visibility_timeout_seconds = each.value.visibility_timeout_seconds
   message_retention_seconds  = each.value.message_retention_seconds
-  sqs_managed_sse_enabled    = true
+  kms_master_key_id          = local.key_arn
   tags                       = var.tags
+
+  lifecycle {
+    precondition {
+      condition     = local.key_arn != null
+      error_message = "Subscription queues need a customer managed key: set kms_key_arn, or leave create_kms_key true."
+    }
+  }
 }
 
 # Receives one record per event that the subscriber could not deliver.
@@ -168,7 +220,7 @@ resource "aws_sqs_queue" "dead_letter" {
 
   name                      = "${var.name}-${each.key}-dlq"
   message_retention_seconds = 1209600
-  sqs_managed_sse_enabled   = true
+  kms_master_key_id         = local.key_arn
   tags                      = var.tags
 }
 
@@ -196,12 +248,20 @@ resource "aws_iam_role_policy" "delivery" {
   role = aws_iam_role.delivery[0].id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Sid      = "DeliverAndDeadLetter"
-      Effect   = "Allow"
-      Action   = "sqs:SendMessage"
-      Resource = local.queue_arns
-    }]
+    Statement = [
+      {
+        Sid      = "DeliverAndDeadLetter"
+        Effect   = "Allow"
+        Action   = "sqs:SendMessage"
+        Resource = local.queue_arns
+      },
+      {
+        Sid      = "EncryptForQueues"
+        Effect   = "Allow"
+        Action   = ["kms:GenerateDataKey", "kms:Decrypt"]
+        Resource = local.key_arn
+      },
+    ]
   })
 }
 

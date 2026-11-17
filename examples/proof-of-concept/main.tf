@@ -207,14 +207,17 @@ resource "aws_iam_role_policy" "service" {
   })
 }
 
+# Disposable test queues: SQS-managed encryption, no key to leave behind.
 resource "aws_sqs_queue" "target" {
-  provider = aws.spoke
-  name     = "${var.name_prefix}-target"
+  provider                = aws.spoke
+  name                    = "${var.name_prefix}-target"
+  sqs_managed_sse_enabled = true
 }
 
 resource "aws_sqs_queue" "dlq" {
-  provider = aws.spoke
-  name     = "${var.name_prefix}-dlq"
+  provider                = aws.spoke
+  name                    = "${var.name_prefix}-dlq"
+  sqs_managed_sse_enabled = true
 }
 
 resource "aws_iam_role" "delivery" {

@@ -69,6 +69,18 @@ run "derives_tags_source_and_endpoint" {
   }
 
   assert {
+    condition     = aws_kms_key.queues[0].enable_key_rotation && aws_sqs_queue.this["own"].kms_master_key_id == aws_kms_key.queues[0].arn
+    error_message = "Queues must use the created key, which must rotate."
+  }
+
+  assert {
+    condition = one([
+      for s in jsondecode(aws_kms_key.queues[0].policy).Statement : s if s.Sid == "CentralDeliveryRoleEncrypts"
+    ]).Principal.AWS == var.delivery_role_arn
+    error_message = "The key policy must admit the central delivery role."
+  }
+
+  assert {
     condition     = aws_sqs_queue.this["issuing"].name == "tracker-issuing" && aws_sqs_queue.this["issuing"].visibility_timeout_seconds == 120
     error_message = "Queues are named <name>-<key> and take the per-queue settings."
   }
@@ -116,6 +128,29 @@ run "rejects_queues_without_delivery_role" {
 
   variables {
     delivery_role_arn = null
+  }
+
+  expect_failures = [aws_kms_key.queues]
+}
+
+run "uses_a_supplied_key" {
+  command = apply
+
+  variables {
+    kms_key_arn = "arn:aws:kms:eu-west-1:333333333333:key/11111111-2222-3333-4444-555555555555"
+  }
+
+  assert {
+    condition     = length(aws_kms_key.queues) == 0 && aws_sqs_queue.this["own"].kms_master_key_id == var.kms_key_arn
+    error_message = "A supplied key replaces the created one."
+  }
+}
+
+run "refuses_queues_without_a_key" {
+  command = plan
+
+  variables {
+    create_kms_key = false
   }
 
   expect_failures = [aws_sqs_queue.this]

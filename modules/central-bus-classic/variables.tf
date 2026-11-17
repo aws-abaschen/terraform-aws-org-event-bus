@@ -93,6 +93,10 @@ variable "subscriptions" {
     owner      = map(string)
     consumer   = map(string)
     target_arn = string
+
+    # Customer managed key of the target queue (output kms_key_arn of
+    # spoke-connection-classic). The delivery role is granted use of it.
+    target_kms_key_arn = optional(string)
   }))
   default = {}
 
@@ -137,9 +141,15 @@ variable "exempt_principal_arns" {
 }
 
 variable "kms_key_arn" {
-  description = "Customer managed KMS key for the bus. Null uses the AWS owned key."
+  description = "Customer managed KMS key for the bus and the dead-letter queue. Null uses the key this module creates. A key passed in must allow events.amazonaws.com to use it, as the key policy of the created key does."
   type        = string
   default     = null
+}
+
+variable "create_kms_key" {
+  description = "Create a customer managed key with rotation for the bus and the dead-letter queue when kms_key_arn is null. Set false only together with kms_key_arn."
+  type        = bool
+  default     = true
 }
 
 variable "permissions_boundary" {

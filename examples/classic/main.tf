@@ -63,6 +63,8 @@ module "central_bus" {
       owner      = local.authorizer
       consumer   = local.tracker
       target_arn = module.tracker.queue_arns["authorizer"]
+
+      target_kms_key_arn = module.tracker.kms_key_arn
     }
   }
 }

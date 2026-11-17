@@ -655,10 +655,37 @@ roles and the account-to-Platform mapping is passed to `central-bus` explicitly.
 | Module logic | `terraform test` in each of the four directories under `modules/` | The generated policy, tags, filters, rules and endpoint are what the design says. Offline, mocked providers. |
 | Access model | `examples/proof-of-concept` (`terraform apply`, then `./run-tests.sh`) | AWS evaluates the policy as intended, across two accounts. Twelve allow and deny cases. |
 
-The offline checks (format, `terraform validate` on every module and example, and the module
-tests) run with `just test`, or `just win::test` in PowerShell on Windows. The `ci` GitHub
-Actions workflow runs the same checks on every pull request and on `main`. They need no AWS
-credentials.
+The offline checks run with `just check`, or `just win::check` in PowerShell on Windows. The `ci`
+GitHub Actions workflow runs the same checks on every pull request and on `main`. They need no
+AWS credentials.
+
+| Task | Tool | Catches |
+|---|---|---|
+| `just test` | `terraform fmt -check`, `terraform validate`, `terraform test` | Formatting, invalid configuration, and the module logic above |
+| `just lint` | [TFLint](https://github.com/terraform-linters/tflint) with the AWS ruleset (`.tflint.hcl`) | Invalid AWS arguments, deprecated syntax, unused or undocumented variables and outputs, naming |
+| `just scan` | [Checkov](https://www.checkov.io/) (`.checkov.yaml`) and [Trivy](https://trivy.dev/) | AWS misconfigurations: unencrypted queues, wildcard IAM, open security groups, missing key rotation |
+
+`just scan` needs `checkov` (`pip install checkov==3.4.5`) and `trivy` installed; `just lint`
+needs `tflint`. A finding that is intended is suppressed in the code with
+`# checkov:skip=<id>: <reason>` inside the resource, never in a global ignore file. There is one
+today: the example deployment role attaches whatever managed policies its caller passes in.
+
+Not run in CI, because it needs an AWS account: `aws accessanalyzer validate-policy` against the
+generated bus policies (`policy_json` output). Add it once there is an account to run it in.
+
+### Encryption
+
+Every queue and the Classic bus use a customer managed KMS key with rotation. The spoke modules
+and `central-bus-classic` create one by default (`create_kms_key`) or take yours
+(`kms_key_arn`). Two details matter in the Classic fallback, because the delivery role is in
+another account: the consumer's key policy admits the central delivery role, and the central
+module grants that role the matching IAM permission when a subscription declares
+`target_kms_key_arn`. Both are needed; either alone is denied.
+
+The Custom Event Bus of `central-bus` accepts an optional `kms_key_arn`, but the module does not
+create a key for it: the key-policy requirements of the new service are not documented well
+enough to write and test one offline. The proof of concept uses SQS-managed encryption on its
+disposable queues.
 
 The module tests pass. The proof of concept has not been run: nothing in this repository has
 been applied to an AWS account yet. Running it needs two accounts in one organization and an
@@ -727,9 +754,11 @@ Deployment order for the fallback:
 
 1. `central-bus-classic` without subscriptions. It outputs `bus_arn` and `delivery_role_arn`.
 2. `spoke-connection-classic` per service. A consumer declares `queues`; each queue policy
-   admits the central delivery role. It outputs `queue_arns`.
-3. `central-bus-classic` again, with one `subscriptions` entry per queue. The module refuses a
-   target queue outside the accounts of the consumer's top-level unit.
+   admits the central delivery role, and so does the queue key. It outputs `queue_arns` and
+   `kms_key_arn`.
+3. `central-bus-classic` again, with one `subscriptions` entry per queue (`target_arn` and
+   `target_kms_key_arn`). The module refuses a target queue outside the accounts of the
+   consumer's top-level unit.
 
 Because the levels are joined into one string, no hierarchy value may contain the separator.
 The modules reject such values in their inputs, and the bus policy denies any principal whose
@@ -748,8 +777,10 @@ Still to prove on a Classic bus, before relying on the fallback:
 ```text
 .
 ├── README.md
-├── justfile                  # offline checks: fmt, validate, test
+├── justfile                  # offline checks: test, lint, scan, check
 ├── win.just                  # the same tasks for PowerShell
+├── .tflint.hcl               # TFLint rules and AWS ruleset
+├── .checkov.yaml             # Checkov settings
 ├── .github/workflows/ci.yml  # runs the offline checks
 ├── docs/
 │   └── research-eventbridge-org-level.md

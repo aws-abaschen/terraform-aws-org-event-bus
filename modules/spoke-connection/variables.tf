@@ -153,6 +153,18 @@ variable "subscriptions" {
   }
 }
 
+variable "kms_key_arn" {
+  description = "Customer managed KMS key for the subscription and dead-letter queues. Null uses the key this module creates. A key passed in must let this account's IAM policies use it (the default key policy does), because the delivery and workload roles are granted access by identity policy."
+  type        = string
+  default     = null
+}
+
+variable "create_kms_key" {
+  description = "Create a customer managed key with rotation for the queues when kms_key_arn is null. Set false only together with kms_key_arn."
+  type        = bool
+  default     = true
+}
+
 variable "tags" {
   description = "Tags for every resource. Hierarchy tags on the workload role take precedence."
   type        = map(string)

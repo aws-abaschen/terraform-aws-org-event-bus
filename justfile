@@ -30,3 +30,16 @@ test: validate
       echo "== $dir"
       terraform -chdir="$dir" test
     done
+
+# TFLint with the AWS ruleset
+lint:
+    tflint --init
+    tflint --recursive --format compact
+
+# Checkov and Trivy: AWS best-practice and security checks (pip install checkov==3.4.5)
+scan:
+    checkov --config-file .checkov.yaml
+    trivy config --exit-code 1 --severity LOW,MEDIUM,HIGH,CRITICAL --skip-dirs .terraform .
+
+# Everything CI runs
+check: test lint scan

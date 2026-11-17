@@ -82,6 +82,45 @@ run "derives_tags_filters_and_endpoint" {
     condition     = length(aws_sqs_queue.subscription) == 3 && length(aws_sqs_queue.dead_letter) == 3
     error_message = "Each subscription needs a queue and a dead-letter queue."
   }
+
+  assert {
+    condition = (
+      aws_kms_key.queues[0].enable_key_rotation &&
+      aws_sqs_queue.subscription["own"].kms_master_key_id == aws_kms_key.queues[0].arn &&
+      aws_sqs_queue.dead_letter["own"].kms_master_key_id == aws_kms_key.queues[0].arn
+    )
+    error_message = "Queues and dead-letter queues must use the created, rotating key."
+  }
+
+  assert {
+    condition = one([
+      for s in jsondecode(aws_iam_role_policy.delivery[0].policy).Statement : s if s.Sid == "EncryptForQueues"
+    ]).Resource == aws_kms_key.queues[0].arn
+    error_message = "The delivery role must be allowed to encrypt for the queues."
+  }
+}
+
+run "uses_a_supplied_key" {
+  command = apply
+
+  variables {
+    kms_key_arn = "arn:aws:kms:eu-west-1:111111111111:key/11111111-2222-3333-4444-555555555555"
+  }
+
+  assert {
+    condition     = length(aws_kms_key.queues) == 0 && aws_sqs_queue.subscription["own"].kms_master_key_id == var.kms_key_arn
+    error_message = "A supplied key replaces the created one."
+  }
+}
+
+run "refuses_queues_without_a_key" {
+  command = plan
+
+  variables {
+    create_kms_key = false
+  }
+
+  expect_failures = [aws_sqs_queue.subscription]
 }
 
 run "second_service_in_a_vpc" {
