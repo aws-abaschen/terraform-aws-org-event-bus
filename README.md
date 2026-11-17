@@ -684,6 +684,8 @@ service's workload role and nothing else. See `examples/deployer-role`.
 | `publish` | `bool` | `true` | Allow the workload role to publish. |
 | `visibility` | `object({ key, separator, public_value })` | same defaults as `central-bus` | Output `visibility` of `central-bus`. |
 | `subscriptions` | `map(object)` | `{}` | Per subscription: optional `visibility` (list of audiences this service belongs to), optional `owner` path prefix (default: this service when `visibility` is not set, otherwise a narrowing), `transformer_type` (`WITH_METADATA` or `RAW`), queue timings. |
+| `kms_key_arn` | `string` | `null` | Customer managed key for the queues. Null uses the key the module creates. |
+| `create_kms_key` | `bool` | `true` | Create a rotating key when `kms_key_arn` is null. |
 | `tags` | `map(string)` | `{}` | Tags for every resource. |
 
 A subscription with `visibility` receives every event whose producer set one of the listed
@@ -694,7 +696,7 @@ only if the central stack holds a matching grant.
 **Outputs:** `role_arn`, `role_name`, `hierarchy_tags`, `event_metadata`, `visibility_audiences`,
 `events_endpoint_id`,
 `sqs_endpoint_id`, `endpoint_security_group_id`, `queue_arns`, `queue_urls`,
-`dead_letter_queue_arns`, `subscriber_arns`.
+`dead_letter_queue_arns`, `subscriber_arns`, `kms_key_arn`.
 
 **Example**
 
@@ -779,10 +781,35 @@ time and written into the bus policy.
 | Module logic | `terraform test` in each of the three directories under `modules/` | The generated policy, tags, filters, rules and endpoint are what the design says. Offline, mocked providers. |
 | Access model | `examples/proof-of-concept` (`terraform apply`, then `./run-tests.sh`) | AWS evaluates the policy as intended, across two accounts. Eighteen allow and deny cases, including visibility and the two-filter bypass. |
 
-The offline checks (format, `terraform validate` on every module and example, and the module
-tests) run with `just test`, or `just win::test` in PowerShell on Windows. The `ci` GitHub
-Actions workflow runs the same checks on every pull request and on `main`. They need no AWS
-credentials.
+The offline checks run with `just check`, or `just win::check` in PowerShell on Windows. The `ci`
+GitHub Actions workflow runs the same checks on every pull request and on `main`. They need no
+AWS credentials.
+
+| Task | Tool | Catches |
+|---|---|---|
+| `just test` | `terraform fmt -check`, `terraform validate`, `terraform test` | Formatting, invalid configuration, and the module logic above |
+| `just lint` | [TFLint](https://github.com/terraform-linters/tflint) with the AWS ruleset (`.tflint.hcl`) | Invalid AWS arguments, deprecated syntax, unused or undocumented variables and outputs, naming |
+| `just scan` | [Checkov](https://www.checkov.io/) (`.checkov.yaml`) and [Trivy](https://trivy.dev/) | AWS misconfigurations: unencrypted queues, wildcard IAM, open security groups, missing key rotation |
+
+`just scan` needs `checkov` (`pip install checkov==3.4.5`) and `trivy` installed; `just lint`
+needs `tflint`. A finding that is intended is suppressed in the code with
+`# checkov:skip=<id>: <reason>` inside the resource, never in a global ignore file. There is one
+today: the example deployment role attaches whatever managed policies its caller passes in.
+
+Not run in CI, because it needs an AWS account: `aws accessanalyzer validate-policy` against the
+generated bus policies (`policy_json` output). Add it once there is an account to run it in.
+
+### Encryption
+
+Every subscription queue and dead-letter queue uses a customer managed KMS key with rotation.
+`spoke-connection` creates one by default (`create_kms_key`) or takes yours (`kms_key_arn`). The
+delivery and workload roles are granted the key through identity policy, so a key passed in must
+let this account's IAM policies use it.
+
+The Custom Event Bus of `central-bus` accepts an optional `kms_key_arn`, but the module does not
+create a key for it: the key-policy requirements of the new service are not documented well
+enough to write and test one offline. The proof of concept uses SQS-managed encryption on its
+disposable queues.
 
 The module tests pass. The proof of concept has not been run: nothing in this repository has
 been applied to an AWS account yet. Running it needs two accounts in one organization and an
@@ -828,8 +855,10 @@ with each:
 ```text
 .
 ├── README.md
-├── justfile                  # offline checks: fmt, validate, test
+├── justfile                  # offline checks: test, lint, scan, check
 ├── win.just                  # the same tasks for PowerShell
+├── .tflint.hcl               # TFLint rules and AWS ruleset
+├── .checkov.yaml             # Checkov settings
 ├── .github/workflows/ci.yml  # runs the offline checks
 ├── docs/
 │   └── research-eventbridge-org-level.md
